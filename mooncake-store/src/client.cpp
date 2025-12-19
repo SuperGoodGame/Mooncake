@@ -407,6 +407,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    auto t0_batch_get_wrapper = std::chrono::steady_clock::now();
     auto batched_query_results = BatchQuery(object_keys);
 
     // If any queries failed, return error results immediately for failed
@@ -448,6 +449,27 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[valid_indices[i]] = valid_results[i];
         }
     }
+
+    auto us_batch_get_wrapper = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - t0_batch_get_wrapper)
+                                    .count();
+    
+    // Calculate total data size and throughput
+    size_t total_bytes = 0;
+    for (const auto& key : object_keys) {
+        auto it = slices.find(key);
+        if (it != slices.end()) {
+            for (const auto& slice : it->second) {
+                total_bytes += slice.size;
+            }
+        }
+    }
+    double throughput_gbps = (total_bytes * 8.0) / (us_batch_get_wrapper * 1000.0);  // Gbps
+    
+    LOG(WARNING) << "[EVAL] BATCH_GET keys=" << object_keys.size()
+                 << " time_us=" << us_batch_get_wrapper
+                 << " size_bytes=" << total_bytes
+                 << " throughput_gbps=" << throughput_gbps;
 
     return results;
 }
@@ -615,12 +637,32 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Wait for all transfers to complete
     for (auto& [index, key, future] : pending_transfers) {
+        auto t0_single_get = std::chrono::steady_clock::now();
         ErrorCode result = future.get();
+        auto us_single_get = std::chrono::duration_cast<std::chrono::microseconds>(
+                                 std::chrono::steady_clock::now() - t0_single_get)
+                                 .count();
+        
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
             results[index] = tl::unexpected(result);
         } else {
+            // Calculate single key data size and throughput
+            size_t key_bytes = 0;
+            auto slices_it = slices.find(key);
+            if (slices_it != slices.end()) {
+                for (const auto& slice : slices_it->second) {
+                    key_bytes += slice.size;
+                }
+            }
+            double key_throughput_gbps = (key_bytes * 8.0) / (us_single_get * 1000.0);  // Gbps (bits / microseconds / 10^6)
+            
+            LOG(WARNING) << "[EVAL] GET key=" << key
+                         << " time_us=" << us_single_get
+                         << " size_bytes=" << key_bytes
+                         << " throughput_gbps=" << key_throughput_gbps;
+            
             VLOG(1) << "Transfer completed successfully for key: " << key;
             results[index] = {};
         }
@@ -711,7 +753,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
-
+    
+    // Enhanced logging for monitoring evaluation
+    size_t total_bytes = 0;
+    for (const auto& slice : slices) {
+        total_bytes += slice.size;
+    }
+    double throughput_gbps = (total_bytes * 8.0) / (us_put * 1000.0);  // Gbps (bits / microseconds / 10^6)
+    LOG(WARNING) << "[EVAL] PUT key=" << key 
+                 << " time_us=" << us_put 
+                 << " size_bytes=" << total_bytes
+                 << " throughput_gbps=" << throughput_gbps;
     // End put operation
     auto end_result = master_client_.PutEnd(key, ReplicaType::MEMORY);
     if (!end_result) {

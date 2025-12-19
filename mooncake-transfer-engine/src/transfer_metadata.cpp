@@ -649,12 +649,18 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
             desc = rpc_meta_map_[server_name];
+            LOG(INFO) << "getRpcMetaEntry: found in cache, server_name=" << server_name
+                      << ", cached_ip=" << desc.ip_or_host_name 
+                      << ", cached_port=" << desc.rpc_port;
             return 0;
         }
     }
     RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+    LOG(INFO) << "getRpcMetaEntry: not in cache, server_name=" << server_name
+              << ", p2p_mode=" << p2p_handshake_mode_;
     if (p2p_handshake_mode_) {
         auto [ip, port] = parseHostNameWithPort(server_name);
+        LOG(INFO) << "getRpcMetaEntry: parsed from server_name, ip=" << ip << ", port=" << port;
         desc.ip_or_host_name = ip;
         desc.rpc_port = port;
     } else {
@@ -665,7 +671,11 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         }
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
         desc.rpc_port = (uint16_t)rpcMetaJSON["rpc_port"].asUInt();
+        LOG(INFO) << "getRpcMetaEntry: got from metadata server, ip=" 
+                  << desc.ip_or_host_name << ", port=" << desc.rpc_port;
     }
+    LOG(INFO) << "getRpcMetaEntry: caching result, server_name=" << server_name
+              << ", ip=" << desc.ip_or_host_name << ", port=" << desc.rpc_port;
     rpc_meta_map_[server_name] = desc;
     return 0;
 }
@@ -699,14 +709,20 @@ int TransferMetadata::startHandshakeDaemon(
 int TransferMetadata::sendHandshake(const std::string &peer_server_name,
                                     const HandShakeDesc &local_desc,
                                     HandShakeDesc &peer_desc) {
+    LOG(INFO) << "sendHandshake: peer_server_name=" << peer_server_name;
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        LOG(ERROR) << "sendHandshake: getRpcMetaEntry failed for " << peer_server_name;
         return ERR_METADATA;
     }
+    LOG(INFO) << "sendHandshake: will connect to " << peer_location.ip_or_host_name 
+              << ":" << peer_location.rpc_port;
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;
+    LOG(INFO) << "sendHandshake: calling handshake_plugin_->send()...";
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
+    LOG(INFO) << "sendHandshake: handshake_plugin_->send() returned: " << ret;
     if (ret) return ret;
     TransferHandshakeUtil::decode(peer, peer_desc);
     if (!peer_desc.reply_msg.empty()) {

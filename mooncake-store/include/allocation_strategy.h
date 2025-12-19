@@ -169,7 +169,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             auto buffer =
                 allocateSingleBuffer(allocators, allocators_by_name, slice_size,
                                      config, used_segments);
-
+            LOG(INFO)<<"allocateSingleBuffer"<<buffer->getSegmentName();
             if (!buffer) {
                 break;
             }
@@ -187,9 +187,23 @@ class RandomAllocationStrategy : public AllocationStrategy {
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
         size_t slice_size, size_t replica_num, const ReplicateConfig& config) {
-        std::unordered_set<std::string> empty_segments;
+        std::unordered_set<std::string> used_segments;
+#ifdef MOONCAKE_WJH_TEST_REMOTE_SEGMENT
+        // 排除名字中包含 "14" 的 segment
+        for (size_t i = 0; i < allocators.size(); ++i) {
+            std::string segment_name = allocators[i]->getSegmentName();
+            if (segment_name.find("10.0.14.1") != std::string::npos) {
+                used_segments.insert(segment_name);
+                LOG(INFO) << "Excluding segment with '10.0.14.1' in name: " << segment_name;
+            }
+        }
+#endif
+// 打印allocators_by_name
+        // for (const auto& [segment_name, allocators_vec] : allocators_by_name) {
+        //     LOG(INFO) << "Segment: " << segment_name ;
+        // }
         return allocateSlice(allocators, allocators_by_name, slice_size,
-                             replica_num, config, empty_segments);
+                             replica_num, config, used_segments);
     }
 
     /**

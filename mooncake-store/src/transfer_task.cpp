@@ -388,6 +388,11 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     Transport::TransferRequest::OpCode op_code) {
+    if(op_code != Transport::TransferRequest::READ)
+        LOG(WARNING) << "WRITE";
+    else
+        LOG(WARNING) << "READ";
+
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -516,6 +521,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
     // Submit transfer
     Status s = engine_.submitTransfer(batch_id, requests);
+    // Performance critical - logging disabled
+    // LOG(WARNING) << "submitTransfer Engine type: " << typeid(engine_).name();
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
                    << s.code();
@@ -560,6 +567,7 @@ TransferStrategy TransferSubmitter::selectStrategy(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     const std::vector<Slice>& slices) const {
     // Check if memcpy operations are enabled via environment variable
+    // LOG(WARNING)<< "memcpy_enabled_=" << memcpy_enabled_;
     if (!memcpy_enabled_) {
         VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
                    "variable";
@@ -577,7 +585,10 @@ TransferStrategy TransferSubmitter::selectStrategy(
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
     std::string local_ep = engine_.getLocalIpAndPort();
-
+    // Performance critical - logging disabled
+    LOG(WARNING) << "local_ep=" << local_ep;
+    for(const auto& h : handles)
+        LOG(WARNING) << "h.transport_endpoint_=" << h.transport_endpoint_;
     if (!local_ep.empty()) {
         return std::all_of(handles.begin(), handles.end(),
                            [&local_ep](const auto& h) {

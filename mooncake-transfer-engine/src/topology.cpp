@@ -331,6 +331,20 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
     if (resolved_matrix_.count(storage_type) == 0) return ERR_DEVICE_NOT_FOUND;
 
     auto &entry = resolved_matrix_[storage_type];
+    // LOG(WARNING) << "this is Topology::selectDevice";
+    // LOG(WARNING) << "the request storage_type: " << storage_type;
+    // for (const auto& pair : resolved_matrix_) {
+    //     //LOG(WARNING) <<"storage_type: " << pair.first ;
+    //     //LOG(WARNING) <<"  preferred_hca: ";
+    //     for (int hca : pair.second.preferred_hca) {
+    //         LOG(WARNING) << hca << " ";
+    //     }
+    //     LOG(WARNING) << std::endl;
+    //     LOG(WARNING) << "  avail_hca: ";
+    //     for (int hca : pair.second.avail_hca) {
+    //         LOG(WARNING)<<  hca << " ";
+    //     }
+    // }
     if (retry_count == 0) {
         int rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())
@@ -348,6 +362,54 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
         }
     }
     return 0;
+}
+
+std::vector<int> Topology::getAvailableDevices(const std::string storage_type) const {
+    std::vector<int> result;
+    
+    auto it = resolved_matrix_.find(storage_type);
+    LOG(INFO)<< "store_type" << storage_type;
+    if (it == resolved_matrix_.end()) {
+        LOG(WARNING) << "Storage type not found in topology: " << storage_type;
+        return result;  // Return empty vector
+    }
+    
+    const auto &entry = it->second;
+    
+    // First add all preferred devices
+    for (int hca : entry.preferred_hca) {
+        result.push_back(hca);
+    }
+    
+    // Then add all available devices
+    for (int hca : entry.avail_hca) {
+        result.push_back(hca);
+    }
+    
+    // Performance critical path - logging disabled
+    // LOG(INFO) << "getAvailableDevices for storage_type: " << storage_type 
+    //           << ", found " << result.size() << " devices "
+    //           << "(preferred: " << entry.preferred_hca.size() 
+    //           << ", available: " << entry.avail_hca.size() << ")";
+    
+    return result;
+}
+
+bool Topology::getAvailableDevicesRef(const std::string &storage_type,
+                                      const std::vector<int>* &preferred_devices,
+                                      const std::vector<int>* &avail_devices) const {
+    auto it = resolved_matrix_.find(storage_type);
+    if (it == resolved_matrix_.end()) {
+        preferred_devices = nullptr;
+        avail_devices = nullptr;
+        return false;
+    }
+    
+    const auto &entry = it->second;
+    preferred_devices = &entry.preferred_hca;
+    avail_devices = &entry.avail_hca;
+    
+    return true;
 }
 
 int Topology::resolve() {

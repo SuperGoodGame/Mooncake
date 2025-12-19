@@ -111,6 +111,7 @@ void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
 }
 
 int RdmaEndPoint::setupConnectionsByActive() {
+    LOG(INFO)<< "setupConnectionsByActive" << peer_nic_path_;
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(INFO) << "Connection has been established";
@@ -130,7 +131,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
                    << " not found in localhost";
         return ERR_DEVICE_NOT_FOUND;
     }
-
     HandShakeDesc local_desc, peer_desc;
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
@@ -142,16 +142,46 @@ int RdmaEndPoint::setupConnectionsByActive() {
         LOG(ERROR) << "Parse peer nic path failed: " << peer_nic_path_;
         return ERR_INVALID_ARGUMENT;
     }
-
-    int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
-                                             peer_desc);
-    if (rc) return rc;
+    LOG(INFO)<< "setupConnectionsByActive4: calling sendHandshake, peer_nic_path=" << peer_nic_path_
+              << ", peer_server_name=" << peer_server_name
+              << ", local_desc.local_nic_path=" << local_desc.local_nic_path
+              << ", local_desc.peer_nic_path=" << local_desc.peer_nic_path
+              << ", local_desc.qp_num.size=" << local_desc.qp_num.size();
+    
+    int rc = -999;
+    try {
+        rc = context_.engine().sendHandshake(peer_server_name, local_desc, peer_desc);
+        LOG(INFO) << "sendHandshake returned normally: rc=" << rc 
+                  << ", peer_nic_path=" << peer_nic_path_;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "sendHandshake threw exception: " << e.what()
+                   << ", peer_server_name=" << peer_server_name
+                   << ", peer_nic_path=" << peer_nic_path_;
+        return ERR_ENDPOINT;
+    } catch (...) {
+        LOG(ERROR) << "sendHandshake threw unknown exception"
+                   << ", peer_server_name=" << peer_server_name
+                   << ", peer_nic_path=" << peer_nic_path_;
+        return ERR_ENDPOINT;
+    }
+    
+    if (rc) {
+        LOG(ERROR) << "sendHandshake FAILED: rc=" << rc 
+                   << ", peer_server_name=" << peer_server_name
+                   << ", local_nic_path=" << local_desc.local_nic_path
+                   << ", peer_nic_path=" << local_desc.peer_nic_path;
+        return rc;
+    }
+    
+    LOG(INFO) << "Checking peer_desc.reply_msg, empty=" << peer_desc.reply_msg.empty();
     if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "Reject the handshake request by peer "
-                   << local_desc.peer_nic_path;
+        LOG(ERROR) << "Handshake REJECTED by peer: " << local_desc.peer_nic_path
+                   << ", reply_msg: " << peer_desc.reply_msg
+                   << ", peer.local_nic_path=" << peer_desc.local_nic_path
+                   << ", peer.peer_nic_path=" << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
     }
-
+    LOG(INFO)<< "setupConnectionsByActive5" << peer_nic_path_;
     if (peer_desc.local_nic_path != peer_nic_path_ ||
         peer_desc.peer_nic_path != local_desc.local_nic_path) {
         LOG(ERROR) << "Invalid argument: received packet mismatch, "
@@ -161,8 +191,15 @@ int RdmaEndPoint::setupConnectionsByActive() {
                    << ", peer.local_nic_path: " << peer_desc.local_nic_path
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
+    }else{
+        LOG(INFO) << "OK request  "
+                      "local.local_nic_path: "
+                   << local_desc.local_nic_path
+                   << ", local.peer_nic_path: " << local_desc.peer_nic_path
+                   << ", peer.local_nic_path: " << peer_desc.local_nic_path
+                   << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
     }
-
+    LOG(INFO)<< "setupConnectionsByActive6" << peer_nic_path_;
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
@@ -183,6 +220,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         disconnectUnlocked();
     }
 
+    LOG(INFO) << "setupConnectionsByPassive2: Verifying nic paths - peer_nic_path=" 
+              << context_.nicPath() << ", local_nic_path=" << peer_nic_path_;
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
         local_desc.reply_msg =
@@ -206,13 +245,21 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     local_desc.peer_nic_path = peer_nic_path_;
     local_desc.qp_num = qpNum();
 
+    LOG(INFO) << "setupConnectionsByPassive3: Parsed peer_server_name=" << peer_server_name 
+              << ", peer_nic_name=" << peer_nic_name;
+
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
         for (auto &nic : segment_desc->devices)
-            if (nic.name == peer_nic_name)
-                return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
+            if (nic.name == peer_nic_name) {
+                LOG(INFO) << "setupConnectionsByPassive4: Found peer device, calling doSetupConnection with gid=" 
+                          << nic.gid << ", lid=" << nic.lid ;
+                int ret = doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
                                          &local_desc.reply_msg);
+                LOG(INFO) << "setupConnectionsByPassive5: doSetupConnection returned " << ret;
+                return ret;
+            }
     }
     local_desc.reply_msg =
         "Peer nic not found in that server: " + peer_nic_path_;
@@ -268,6 +315,7 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!active_) return 0;
+    // change
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());

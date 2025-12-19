@@ -148,6 +148,7 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     if (FLAGS_max_threads != 4) {  // 4 is the default value
         LOG(WARNING) << "max_threads is deprecated, use rpc_thread_num instead";
     }
+    LOG(WARNING) << "This is test change for source-build";
     if (FLAGS_port != 50051) {  // 50051 is the default value
         LOG(WARNING) << "port is deprecated, use rpc_port instead";
     }
@@ -303,7 +304,8 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
         auto server =
             std::make_unique<mooncake::HttpMetadataServer>(port, host);
         server->start();
-
+        LOG(INFO) << "change flag!";
+        LOG(INFO) << "change flag!";
         // Check if server started successfully
         if (server->is_running()) {
             LOG(INFO) << "C++ HTTP metadata server started successfully";

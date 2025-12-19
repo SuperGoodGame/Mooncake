@@ -19,6 +19,7 @@
 #include <sys/time.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <set>
@@ -32,6 +33,11 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 namespace mooncake {
+
+// Define static members
+std::unique_ptr<RdmaTrafficMonitorClient> RdmaTransport::monitor_client_ = nullptr;
+std::mutex RdmaTransport::monitor_mutex_;
+
 RdmaTransport::RdmaTransport() {}
 
 RdmaTransport::~RdmaTransport() {
@@ -79,6 +85,23 @@ int RdmaTransport::install(std::string &local_server_name,
     if (ret) {
         LOG(ERROR) << "RdmaTransport: cannot publish segments";
         return ret;
+    }
+    
+    // Initialize static traffic monitor client (once)
+    std::lock_guard<std::mutex> lock(monitor_mutex_);
+    if (!monitor_client_) {
+        try {
+            monitor_client_ = std::make_unique<RdmaTrafficMonitorClient>();
+            if (monitor_client_->connect()) {
+                LOG(INFO) << "[Monitor] Connected to traffic monitor successfully";
+            } else {
+                LOG(WARNING) << "[Monitor] Failed to connect to traffic monitor";
+                monitor_client_.reset();
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "[Monitor] Exception creating monitor client: " << e.what();
+            monitor_client_.reset();
+        }
     }
 
     return 0;
@@ -230,7 +253,9 @@ int RdmaTransport::allocateLocalSegmentID() {
         device_desc.gid = entry->gid();
         desc->devices.push_back(device_desc);
     }
+    // CHANGE FOR FIXING COPY ASSIGNMENT OF NON-COPYABLE TOPOLOGY
     desc->topology = *(local_topology_.get());
+    //desc->topology = std::move(*(local_topology_.get()));  // 使用移动
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
@@ -308,6 +333,7 @@ Status RdmaTransport::submitTransferTask(
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
+    LOG(INFO)<<"submitTransferTask: task_list size="<<task_list.size();
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -316,11 +342,24 @@ Status RdmaTransport::submitTransferTask(
         auto &request = *task.request;
 
         auto request_buffer_id = -1, request_device_id = -1;
+        auto select1_start = std::chrono::high_resolution_clock::now();
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
                          request.length, request_buffer_id,
                          request_device_id)) {
             request_buffer_id = -1;
             request_device_id = -1;
+        }
+        auto select1_end = std::chrono::high_resolution_clock::now();
+        auto select1_us = std::chrono::duration_cast<std::chrono::microseconds>(select1_end - select1_start).count();
+        
+        // Log device selection for evaluation
+        if (request_device_id >= 0 && request_device_id < static_cast<int>(context_list_.size())) {
+            std::string device_name = context_list_[request_device_id]->deviceName();
+            LOG(WARNING) << "[EVAL] LOCAL_DEVICE_SELECTED device=" << device_name 
+                         << " device_id=" << request_device_id
+                         << " buffer_id=" << request_buffer_id
+                         << " selection_time_us=" << select1_us
+                         << " transfer_size=" << request.length;
         }
 
         for (uint64_t offset = 0; offset < request.length;
@@ -350,21 +389,31 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
+//            LOG(INFO)<<"submitTransferTask: request_buffer_id="<<request_buffer_id<<", request_device_id="<<request_device_id;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
                 found_device = true;
                 buffer_id = request_buffer_id;
                 device_id = request_device_id;
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
+                LOG(INFO)<< "daole here in submitTransferTask";
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
-                assert(device_id >= 0 &&
-                       static_cast<size_t>(device_id) < context_list_.size());
+                if (device_id < 0 || static_cast<size_t>(device_id) >= context_list_.size()) {
+                    // LOG(ERROR) << "[Monitor] Invalid device_id=" << device_id;
+                    continue;
+                }
                 auto &context = context_list_[device_id];
-                assert(context.get());
-                if (!context->active()) continue;
+                if (!context.get()) {
+                    // LOG(ERROR) << "[Monitor] context is null for device_id=" << device_id;
+                    continue;
+                }
+                if (!context->active()) {
+                    // LOG(WARNING) << "[Monitor] context not active for device_id=" << device_id;
+                    continue;
+                }
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
                            local_segment_desc->buffers.size());
@@ -384,7 +433,19 @@ Status RdmaTransport::submitTransferTask(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             } else {
+                // Device found, proceed with slice setup
+                if (device_id < 0 || static_cast<size_t>(device_id) >= context_list_.size()) {
+                    LOG(ERROR) << "Invalid device_id=" << device_id 
+                               << " for final context access";
+                    return Status::InvalidArgument("Invalid device_id: " +
+                                                   std::to_string(device_id));
+                }
                 auto &context = context_list_[device_id];
+                if (!context) {
+                    LOG(ERROR) << "Null context for device_id=" << device_id;
+                    return Status::InvalidArgument("Null context for device: " +
+                                                   std::to_string(device_id));
+                }
                 if (!context->active()) {
                     LOG(ERROR) << "Device " << device_id << " is not active";
                     return Status::InvalidArgument("Device " +
@@ -529,7 +590,103 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
                                 size_t length, std::string_view hint,
                                 int &buffer_id, int &device_id,
+                                const std::vector<std::shared_ptr<RdmaContext>>* context_list,
                                 int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    // Performance critical path - logging disabled
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+        // Check if offset is within buffer range
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
+            continue;
+        }
+        
+        // Get available devices from topology
+        std::vector<int> available_devices = 
+            hint.empty() ? desc->topology.getAvailableDevices(buffer.name)
+                        : desc->topology.getAvailableDevices(buffer.name);
+        
+        if (available_devices.empty()) {
+            // Fallback to wildcard location
+            available_devices = 
+                hint.empty() ? desc->topology.getAvailableDevices(kWildcardLocation)
+                            : desc->topology.getAvailableDevices(kWildcardLocation);
+        }
+        
+        if (available_devices.empty()) continue;
+        
+        // Check if we should use static selection (for baseline testing)
+        static bool use_static_selection = []() {
+            const char* env_val = std::getenv("MOONCAKE_USE_STATIC_DEVICE_SELECTION");
+            return env_val && (std::string(env_val) == "1" || std::string(env_val) == "true");
+        }();
+        
+        if (use_static_selection) {
+            // Baseline: always use first available device
+            LOG(INFO) << "[EVAL-BASELINE] Using static device selection due to environment setting";
+            device_id = available_devices[0];
+            VLOG(2) << "[EVAL-BASELINE] Static selection: device_id=" << device_id 
+                    << " (first of " << available_devices.size() << " devices)";
+            return 0;
+        }
+        
+        // Use traffic-aware device selection if monitor is available and multiple devices exist
+        if (monitor_client_ && available_devices.size() > 1) {
+            // Map segment device indices to device names for monitor lookup
+            std::vector<std::string> candidate_device_names;
+            for (int seg_dev_idx : available_devices) {
+                if (seg_dev_idx >= 0 && seg_dev_idx < static_cast<int>(desc->devices.size())) {
+                    candidate_device_names.push_back(desc->devices[seg_dev_idx].name);
+                }
+            }
+            
+            if (!candidate_device_names.empty()) {
+                // Select least loaded device from candidates
+                int best_device_id = monitor_client_->selectLeastLoadedDeviceFrom(candidate_device_names);
+                
+                if (best_device_id >= 0) {
+                    // Map back from monitor device_id to segment device index
+                    std::string best_device_name = monitor_client_->getDeviceName(best_device_id);
+                    for (size_t i = 0; i < available_devices.size(); i++) {
+                        int seg_dev_idx = available_devices[i];
+                        if (seg_dev_idx >= 0 && seg_dev_idx < static_cast<int>(desc->devices.size())) {
+                            if (desc->devices[seg_dev_idx].name == best_device_name) {
+                                device_id = seg_dev_idx;
+                                LOG(INFO) << "[Monitor] Selected least loaded device: " << best_device_name 
+                                         << " (id=" << device_id << ") from " << available_devices.size() << " candidates"<<"buffer id:"<<buffer_id;
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Fallback: use first available device (if monitor selection failed or not applicable)
+        device_id = available_devices[0];
+        LOG(INFO) << "selectDevice: chose device " << device_id 
+                  << " from " << available_devices.size() << " available devices (fallback)"<<"buffer id:"<<buffer_id;
+        if (device_id >= 0) return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
+                                size_t length, int &buffer_id, int &device_id,
+                                int retry_count) {
+    return selectDevice(desc, offset, length, "", buffer_id, device_id,
+                        &context_list_, retry_count);
+}
+
+// Static device selection without monitor (for remote segment selection)
+int RdmaTransport::selectDeviceStatic(SegmentDesc *desc, uint64_t offset,
+                                      size_t length, std::string_view hint,
+                                      int &buffer_id, int &device_id,
+                                      int retry_count) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
     for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
@@ -556,10 +713,48 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
-int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                                size_t length, int &buffer_id, int &device_id,
-                                int retry_count) {
-    return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                        retry_count);
-}
+// int RdmaTransport::startTrafficMonitor() {
+//     if (!local_topology_) {
+//         LOG(WARNING) << "RdmaTransport: Cannot start traffic monitor without topology";
+//         return ERR_INVALID_ARGUMENT;
+//     }
+    
+//     // Get HCA list from topology
+//     const auto& hca_list = local_topology_->getHcaList();
+//     if (hca_list.empty()) {
+//         LOG(INFO) << "RdmaTransport: No HCA devices found, traffic monitor not started";
+//         return 0;
+//     }
+    
+//     try {
+//         traffic_monitor_ = std::make_unique<RdmaTrafficMonitor>();
+//         if (!traffic_monitor_->initialize(hca_list)) {
+//             LOG(WARNING) << "RdmaTransport: Failed to initialize traffic monitor";
+//             traffic_monitor_.reset();
+//             return ERR_NOT_IMPLEMENTED;
+//         }
+        
+//         traffic_monitor_->start();
+//         LOG(INFO) << "RdmaTransport: Traffic monitor started for " 
+//                  << hca_list.size() << " devices";
+//         return 0;
+//     } catch (const std::exception& e) {
+//         LOG(WARNING) << "RdmaTransport: Exception starting traffic monitor: " << e.what();
+//         traffic_monitor_.reset();
+//         return ERR_NOT_IMPLEMENTED;
+//     }
+// }
+
+// void RdmaTransport::recordTransmit(int device_id, uint64_t bytes) {
+//     if (traffic_monitor_) {
+//         traffic_monitor_->recordTransmit(device_id, bytes);
+//     }
+// }
+
+// void RdmaTransport::recordReceive(int device_id, uint64_t bytes) {
+//     if (traffic_monitor_) {
+//         traffic_monitor_->recordReceive(device_id, bytes);
+//     }
+// }
+
 }  // namespace mooncake

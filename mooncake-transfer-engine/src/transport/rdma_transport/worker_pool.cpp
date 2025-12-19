@@ -113,9 +113,11 @@ int WorkerPool::submitPostSend(
         auto hint = globalConfig().enable_dest_device_affinity
                         ? context_.deviceName()
                         : "";
-        if (RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                        slice->rdma.dest_addr, slice->length,
-                                        hint, buffer_id, device_id)) {
+        auto& transport = static_cast<RdmaTransport&>(context_.engine());
+        // Use static device selection for remote segment (topology-based)
+        if (RdmaTransport::selectDeviceStatic(peer_segment_desc.get(),
+                                             slice->rdma.dest_addr, slice->length,
+                                             hint, buffer_id, device_id)) {
             peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
                 slice->target_id, true);
             if (!peer_segment_desc) {
@@ -126,7 +128,7 @@ int WorkerPool::submitPostSend(
                 continue;
             }
 
-            if (RdmaTransport::selectDevice(
+            if (RdmaTransport::selectDeviceStatic(
                     peer_segment_desc.get(), slice->rdma.dest_addr,
                     slice->length, hint, buffer_id, device_id)) {
                 slice->markFailed();
@@ -238,22 +240,40 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
-            LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first << ", mark it inactive";
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            endpoint->set_active(false);
-            failed_nr_polls++;
-            if (context_.active() && failed_nr_polls > 32 &&
-                !success_nr_polls) {
-                LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
-                    << context_.nicPath() << ", mark it inactive";
-                context_.set_active(false);
+        LOG(INFO)<< "daole performPostSend, endpoint=" << entry.first 
+                  << ", connected=" << endpoint->connected()
+                  << ", active=" << endpoint->active();
+        if (!endpoint->connected()) {
+            LOG(INFO) << "Worker[" << thread_id << "]: Endpoint not connected, calling setupConnectionsByActive for " << entry.first;
+            int rc = endpoint->setupConnectionsByActive();
+            LOG(INFO) << "Worker[" << thread_id << "]: setupConnectionsByActive returned: " << rc;
+            if (rc) {
+                LOG(ERROR) << "Worker[" << thread_id << "]: Cannot make connection for endpoint: "
+                           << entry.first << ", mark it inactive. Slices: " << entry.second.size();
+                for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+                endpoint->set_active(false);
+                failed_nr_polls++;
+                if (context_.active() && failed_nr_polls > 32 &&
+                    !success_nr_polls) {
+                    LOG(WARNING)
+                        << "Failed to establish peer endpoints in local RNIC "
+                        << context_.nicPath() << ", mark it inactive";
+                    context_.set_active(false);
+                }
+                entry.second.clear();
+                continue;
             }
-            entry.second.clear();
-            continue;
+        } else {
+            LOG(INFO) << "Worker[" << thread_id << "]: Endpoint already connected: " << entry.first;
         }
+                // Log successful submission for debugging
+        static int submit_count = 0;
+        if (++submit_count <= 20 || submit_count % 100 == 0) {
+            LOG(INFO) << "Worker[" << thread_id << "]: Submitting " << entry.second.size() 
+                      << " slices to endpoint " << entry.first 
+                      << " (total submitted: " << submit_count << ")";
+        }
+        
         endpoint->submitPostSend(entry.second, failed_slice_list);
 #endif
     }
@@ -357,12 +377,14 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             processed_slice_count_++;
         } else {
             auto &peer_segment_desc = segment_desc_map[slice->target_id];
+            auto& transport = static_cast<RdmaTransport&>(context_.engine());
             int buffer_id, device_id;
+            // Use static device selection for remote segment in redispatch
             if (!peer_segment_desc ||
-                RdmaTransport::selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, buffer_id, device_id,
-                                            slice->rdma.retry_cnt)) {
+                RdmaTransport::selectDeviceStatic(peer_segment_desc.get(),
+                                                 slice->rdma.dest_addr,
+                                                 slice->length, "", buffer_id, device_id,
+                                                 slice->rdma.retry_cnt)) {
                 slice->markFailed();
                 processed_slice_count_++;
                 continue;

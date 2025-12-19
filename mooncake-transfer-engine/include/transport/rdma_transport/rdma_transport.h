@@ -30,6 +30,7 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "rdma_traffic_monitor.h"
 
 namespace mooncake {
 
@@ -109,15 +110,26 @@ class RdmaTransport : public Transport {
     int startHandshakeDaemon(std::string &local_server_name);
 
    public:
-    static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
+    int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             int &buffer_id, int &device_id, int retry_cnt = 0);
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
-                            int &device_id, int retry_cnt = 0);
+                            int &device_id, 
+                            const std::vector<std::shared_ptr<RdmaContext>>* context_list,
+                            int retry_cnt = 0);
+    // Static device selection without monitor (for remote segment selection)
+    static int selectDeviceStatic(SegmentDesc *desc, uint64_t offset, size_t length,
+                                  std::string_view hint, int &buffer_id,
+                                  int &device_id, 
+                                  int retry_cnt = 0);
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    
+    // Static monitor client shared by all RdmaTransport instances
+    static std::unique_ptr<RdmaTrafficMonitorClient> monitor_client_;
+    static std::mutex monitor_mutex_;
 };
 
 using TransferRequest = Transport::TransferRequest;

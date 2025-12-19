@@ -363,7 +363,9 @@ auto MasterService::PutStart(const std::string& key,
     VLOG(1) << "key=" << key << ", value_length=" << total_length
             << ", slice_count=" << slice_lengths.size() << ", config=" << config
             << ", action=put_start_begin";
-
+    LOG(INFO) << "key=" << key << ", value_length=" << total_length
+            << ", slice_count=" << slice_lengths.size() << ", config=" << config
+            << ", action=put_start_begin";
     // Lock the shard and check if object already exists
     size_t shard_idx = getShardIndex(key);
     MutexLocker lock(&metadata_shards_[shard_idx].mutex);
@@ -382,7 +384,6 @@ auto MasterService::PutStart(const std::string& key,
             segment_manager_.getAllocatorAccess();
         auto& allocators = allocator_access.getAllocators();
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
-
         auto allocation_result = allocation_strategy_->Allocate(
             allocators, allocators_by_name, slice_lengths, config);
 
@@ -411,6 +412,19 @@ auto MasterService::PutStart(const std::string& key,
     replica_list.reserve(replicas.size());
     for (const auto& replica : replicas) {
         replica_list.emplace_back(replica.get_descriptor());
+    }
+
+    LOG(INFO) << "key=" << key << ", action=put_start_replicas, replicas_num=" << replica_list.size();
+    for (const auto& descriptor : replica_list) {
+        if (descriptor.is_memory_replica()) {
+            const auto& mem_desc = descriptor.get_memory_descriptor();
+            for (const auto& buffer_desc : mem_desc.buffer_descriptors) {
+                LOG(INFO) << "key=" << key << ", action=put_start_replica, replica_host=" << buffer_desc.transport_endpoint_;
+            }
+        } else if (descriptor.is_disk_replica()) {
+            const auto& disk_desc = descriptor.get_disk_descriptor();
+            LOG(INFO) << "key=" << key << ", action=put_start_replica, replica_host=" << disk_desc.file_path;
+        }
     }
 
     // No need to set lease here. The object will not be evicted until

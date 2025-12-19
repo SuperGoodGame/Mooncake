@@ -41,6 +41,12 @@ endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
+option(MOONCAKE_WJH_TEST_REMOTE_SEGMENT "Enable remote segment allocation test" ON)
+if (MOONCAKE_WJH_TEST_REMOTE_SEGMENT)
+  add_compile_definitions(MOONCAKE_WJH_TEST_REMOTE_SEGMENT)
+  message(STATUS "Remote segment allocation test enabled")
+endif()
+
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/include)

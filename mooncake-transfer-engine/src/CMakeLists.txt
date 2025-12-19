@@ -1,4 +1,15 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+# Exclude rdma_traffic_monitor.cpp and traffic_aware_device_selector.cpp (using external monitor library)
+list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*rdma_traffic_monitor\\.cpp$")
+list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*traffic_aware_device_selector\\.cpp$")
+
+# Create IMPORTED library for rdma_traffic_monitor
+add_library(rdma_traffic_monitor SHARED IMPORTED GLOBAL)
+set_target_properties(rdma_traffic_monitor PROPERTIES
+    IMPORTED_LOCATION "/home/jiahuawang/test/myfile/monitor/build/librdma_traffic_monitor.so"
+    INTERFACE_INCLUDE_DIRECTORIES "/home/jiahuawang/test/myfile/monitor/include"
+)
+
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -33,10 +44,12 @@ if (USE_HTTP)
   find_package(CURL REQUIRED)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
+
 target_link_libraries(
     transfer_engine
     PUBLIC
     base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs
+    rdma_traffic_monitor rt
     )
 
 if (USE_CUDA)

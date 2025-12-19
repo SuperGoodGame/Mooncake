@@ -66,9 +66,7 @@ class Topology {
 
     bool empty() const;
 
-    void clear();
-
-    int discover() {
+    void clear();    int discover() {
         std::vector<std::string> filter;
         return discover(filter);
     }
@@ -86,6 +84,17 @@ class Topology {
     int selectDevice(const std::string storage_type, int retry_count = 0);
     int selectDevice(const std::string storage_type, std::string_view hint,
                      int retry_count = 0);
+
+    // Get all available devices for a given storage type
+    // Returns a vector of device IDs, with preferred devices first
+    std::vector<int> getAvailableDevices(const std::string storage_type) const;
+    
+    // High-performance version: get device lists by reference
+    // Returns true if storage_type found, false otherwise
+    // preferred_devices and avail_devices are filled with device IDs
+    bool getAvailableDevicesRef(const std::string &storage_type,
+                                const std::vector<int>* &preferred_devices,
+                                const std::vector<int>* &avail_devices) const;
 
     TopologyMatrix getMatrix() const { return matrix_; }
 

@@ -297,8 +297,10 @@ int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
 int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
 
 std::string TransferEngine::getLocalIpAndPort() {
-    return metadata_->localRpcMeta().ip_or_host_name + ":" +
-           std::to_string(metadata_->localRpcMeta().rpc_port);
+    // LOG(WARNING) << "TransferEngine::getLocalIpAndPort";
+    return local_server_name_;
+    // return metadata_->loc(alRpcMeta).ip_or_host_name + ":" +
+    //        std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
 int TransferEngine::getNotifies(

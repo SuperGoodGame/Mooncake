@@ -100,29 +100,29 @@ check_success "Failed to update package lists"
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
-SYSTEM_PACKAGES="build-essential \
-                  cmake \
-                  git \
-                  wget \
-                  libibverbs-dev \
-                  libgoogle-glog-dev \
-                  libgtest-dev \
-                  libjsoncpp-dev \
-                  libunwind-dev \
-                  libnuma-dev \
-                  libpython3-dev \
-                  libboost-all-dev \
-                  libssl-dev \
-                  libgrpc-dev \
-                  libgrpc++-dev \
-                  libprotobuf-dev \
-                  libyaml-cpp-dev \
-                  protobuf-compiler-grpc \
-                  libcurl4-openssl-dev \
-                  libhiredis-dev \
-                  libjemalloc-dev \
-                  pkg-config \
-                  patchelf"
+# SYSTEM_PACKAGES="build-essential \
+#                   cmake \
+#                   git \
+#                   wget \
+#                   libibverbs-dev \
+#                   libgoogle-glog-dev \
+#                   libgtest-dev \
+#                   libjsoncpp-dev \
+#                   libunwind-dev \
+#                   libnuma-dev \
+#                   libpython3-dev \
+#                   libboost-all-dev \
+#                   libssl-dev \
+#                   libgrpc-dev \
+#                   libgrpc++-dev \
+#                   libprotobuf-dev \
+#                   libyaml-cpp-dev \
+#                   protobuf-compiler-grpc \
+#                   libcurl4-openssl-dev \
+#                   libhiredis-dev \
+#                   libjemalloc-dev \
+#                   pkg-config \
+#                   patchelf"
 
 apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"

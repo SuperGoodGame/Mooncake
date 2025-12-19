@@ -218,6 +218,7 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
                   << current_glbseg_size << " of " << total_glbseg_size;
         void *ptr =
             allocate_buffer_allocator_memory(segment_size, this->protocol);
+        LOG(INFO) <<"finish allocate_buffer_allocator_memory";
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);

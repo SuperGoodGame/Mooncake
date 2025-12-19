@@ -113,8 +113,10 @@ Status MultiTransport::submitTransfer(
     for (auto &entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
         if (!status.ok()) {
-            // LOG(ERROR) << "Failed to submit transfer task to "
-            //            << entry.first->getName();
+            LOG(ERROR) << "Failed to submit transfer task to "
+                       << entry.first->getName();
+            // 打印entry 类型
+            LOG(ERROR) << "Entry type: " << typeid(entry.first).name();
             overall_status = status;
         }
     }
@@ -244,10 +246,14 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
-    if (transport->install(local_server_name_, metadata_, topo)) {
+    int install_ret = transport->install(local_server_name_, metadata_, topo);
+    if (install_ret != 0) {
+        LOG(ERROR) << "Failed to install transport: " << proto 
+                   << ", install() returned: " << install_ret;
         return nullptr;
     }
 
+    LOG(INFO) << "Successfully installed transport: " << proto;
     transport_map_[proto] = std::shared_ptr<Transport>(transport);
     return transport;
 }
@@ -256,10 +262,13 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        Transport *&transport) {
     auto target_segment_desc = metadata_->getSegmentDescByID(entry.target_id);
     if (!target_segment_desc) {
+        LOG(ERROR) << "Invalid target segment ID: " << entry.target_id;
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+    // Performance critical path - only log errors
+    
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
@@ -269,10 +278,12 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
     }
 #endif
     if (!transport_map_.count(proto)) {
+        LOG(ERROR) << "Transport '" << proto << "' not found in transport_map_!";
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
     }
     transport = transport_map_[proto].get();
+    // LOG(INFO) << "Selected transport: " << proto;
     return Status::OK();
 }
 
