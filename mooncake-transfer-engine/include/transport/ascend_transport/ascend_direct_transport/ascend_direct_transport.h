@@ -16,22 +16,17 @@
 #ifndef ASCEND_DIRECT_TRANSPORT_H
 #define ASCEND_DIRECT_TRANSPORT_H
 
-#include <atomic>
-#include <cstddef>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <condition_variable>
-#include <set>
 
-#include <acl/acl.h>
 #include "transfer_metadata.h"
 #include "transport/transport.h"
-#include "adxl/adxl_engine.h"
+
+#include "slice_dispatcher.h"
+#include "transfer_executor_base.h"
+#include <acl/acl.h>
 
 namespace mooncake {
 class TransferMetadata;
@@ -77,55 +72,31 @@ class AscendDirectTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    void workerThread();
-
-    void processSliceList(const std::vector<Slice *> &slice_list);
-
-    void localCopy(TransferRequest::OpCode opcode,
-                   const std::vector<Slice *> &slice_list);
-
-    void copyWithSync(TransferRequest::OpCode opcode,
-                      const std::vector<Slice *> &slice_list,
-                      aclrtMemcpyKind kind);
-
-    void copyWithAsync(TransferRequest::OpCode opcode,
-                       const std::vector<Slice *> &slice_list,
-                       aclrtMemcpyKind kind);
-
-    uint16_t findAdxlListenPort() const;
-
-   private:
-    int InitAdxlEngine();
-
-    int checkAndConnect(const std::string &target_adxl_engine_name);
-
-    int disconnect(const std::string &target_adxl_engine_name,
-                   int32_t timeout_in_millis);
-
-    std::atomic_bool running_;
-    std::unique_ptr<adxl::AdxlEngine> adxl_;
-    std::map<void *, adxl::MemHandle> addr_to_mem_handle_;
-    std::mutex mem_handle_mutex_;
-
-    // Connection management for segment connections
-    std::set<std::string> connected_segments_;
-    std::mutex connection_mutex_;
-
-    // Async processing related members (similar to hccl_transport)
-    std::thread worker_thread_;
-    std::queue<std::vector<Slice *>> slice_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-
-    int32_t device_logic_id_{};
-    aclrtContext rt_context_{nullptr};
-    int32_t connect_timeout_ = 3000;
-    int32_t transfer_timeout_ = 3000;
-    std::string local_adxl_engine_name_{};
-    aclrtStream stream_{};
-    bool use_buffer_pool_{false};
+    // Add one engine to segment desc
+    int addEngineToSegmentDesc(int32_t device_id, aclrtContext context,
+                               const std::string &host_ip, SegmentDesc *desc);
 
     int32_t base_port_ = 20000;
+    // Mirrors globalConfig().ascend_agent_mode. ascend_agent_mode is enabled
+    // both by the dummy client (inference/GPU process) and by the standalone
+    // real client (real_client_main). The dummy client never installs this
+    // transport, so within AscendDirectTransport this flag effectively means
+    // "I am the independently-launched real client". In this mode the local
+    // segment enumerates every local NPU device via ContextManager (the real
+    // client owns all devices) instead of using the single current-device
+    // context.
+    bool agent_mode_{false};
+    bool roce_mode_{false};
+    // Whether this TE uses Ascend fabric memory (host mem for Store, e.g. RoCE
+    // D2H/H2D). Captured once at install time from globalConfig() and gated on
+    // ascend_store_te_init, so a non-Store (e.g. P2P/HCCS) TE never inherits a
+    // Store TE's fabric setting that leaked into the process-global flag. All
+    // transfer-time decisions read this member, not the global.
+    bool use_fabric_mem_{false};
+    std::vector<aclrtContext> local_engine_contexts_;
+
+    std::unique_ptr<TransferExecutorBase> transfer_executor_;
+    std::unique_ptr<ISliceDispatcher> dispatcher_;
 };
 
 }  // namespace mooncake

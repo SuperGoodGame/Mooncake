@@ -1,7 +1,8 @@
-import os
 import sys
 import platform
-from setuptools import setup, Distribution
+
+import numpy as np
+from setuptools import setup, Distribution, Extension
 from wheel.bdist_wheel import bdist_wheel
 
 # ---------------------------------------------------------------------------
@@ -32,16 +33,73 @@ def _detect_manylinux_tag() -> str:
     if glibc_version_string is not None:
         ver = glibc_version_string()
     else:
-        import ctypes
+        import subprocess
+        import shutil
 
-        try:
-            ver = (
-                ctypes.CDLL("libc.so.6")
-                .gnu_get_libc_version()
-                .decode("ascii", "replace")
-            )
-        except Exception:
-            ver = "2.17"  # conservative baseline
+        # Try getconf first (POSIX standard, most reliable, no hardcoded libc name)
+        ver = None
+        if shutil.which("getconf"):
+            try:
+                result = subprocess.run(
+                    ["getconf", "GNU_LIBC_VERSION"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Output format: "glibc X.Y" or "X.Y"
+                    ver_str = result.stdout.strip()
+                    ver = ver_str.split()[-1] if "glibc" in ver_str else ver_str
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Fallback: use ctypes with dynamic libc detection
+        if ver is None:
+            import ctypes
+
+            try:
+                # Try to find libc dynamically instead of hardcoding "libc.so.6"
+                libc = None
+                # First try the standard name (works for 99.9% of Linux systems)
+                for name in ["libc.so.6", "libc.so"]:
+                    try:
+                        libc = ctypes.CDLL(name)
+                        break
+                    except OSError:
+                        continue
+
+                # If standard names don't work, try to find via ldconfig
+                if libc is None:
+                    try:
+                        result = subprocess.run(
+                            ["ldconfig", "-p"],
+                            capture_output=True,
+                            text=True,
+                            timeout=1,
+                        )
+                        if result.returncode == 0:
+                            for line in result.stdout.split("\n"):
+                                if "libc.so" in line:
+                                    # Extract path from ldconfig output
+                                    # Format: "libc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6"
+                                    parts = line.split("=>")
+                                    if len(parts) == 2:
+                                        libc_path = parts[1].strip()
+                                        libc = ctypes.CDLL(libc_path)
+                                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                        pass
+
+                if libc is not None:
+                    # gnu_get_libc_version returns a const char* (C string)
+                    # Set the return type to c_char_p to get the string properly
+                    libc.gnu_get_libc_version.restype = ctypes.c_char_p
+                    version_bytes = libc.gnu_get_libc_version()
+                    ver = version_bytes.decode("ascii", "replace")
+                else:
+                    raise OSError("libc not found")
+            except Exception:
+                ver = "2.17"  # conservative baseline
 
     major, minor, *_ = ver.split(".")
     return f"manylinux_{major}_{minor}"
@@ -106,43 +164,24 @@ class CustomBdistWheel(bdist_wheel):
         self.plat_name = get_platform()
 
 
+
+# ---------------------------------------------------------------------------
+# C extensions
+# ---------------------------------------------------------------------------
+_fast_copy_ext = Extension(
+    "mooncake._fast_copy",
+    sources=["mooncake/_fast_copy.c"],
+    include_dirs=[np.get_include()],
+    extra_compile_args=["-O2", "-pthread"],
+    extra_link_args=["-lpthread"],
+)
+
+
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
-if int(os.getenv("BUILD_WITH_EP", "0")):
-    import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-    current_dir = os.path.abspath(os.path.dirname(__file__))
-    ext_modules = [
-        CUDAExtension(
-            name="mooncake.ep",
-            include_dirs=[
-                os.path.join(current_dir, "../mooncake-ep/include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
-            sources=["../mooncake-integration/ep/ep_py.cpp"],
-            extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-            },
-            libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "../build/mooncake-ep/src/libmooncake_ep.a"),
-                os.path.join(current_dir, "mooncake/engine.so"),
-            ],
-        )
-    ]
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={
-            "bdist_wheel": CustomBdistWheel,
-            "build_ext": BuildExtension,
-        },
-        ext_modules=ext_modules,
-    )
-else:
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={"bdist_wheel": CustomBdistWheel},
-    )
+setup(
+    distclass=BinaryDistribution,
+    cmdclass={"bdist_wheel": CustomBdistWheel},
+    ext_modules=[_fast_copy_ext],
+)

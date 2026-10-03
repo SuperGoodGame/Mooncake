@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "allocator.h"
-#include "client.h"
+#include "client_service.h"
 #include "types.h"
 
 namespace mooncake {
@@ -69,6 +69,26 @@ class ClientTestWrapper {
     ErrorCode Get(const std::string& key, std::string& value);
     ErrorCode Put(const std::string& key, const std::string& value);
     ErrorCode Delete(const std::string& key);
+    ErrorCode BatchSmoke(const std::string& key_prefix);
+
+    // Returns true if the key has a DISK replica
+    // (master-assigned, written by PutToLocalFile).
+    bool HasDiskReplica(const std::string& key);
+
+    // Returns true if the key has a LOCAL_DISK replica
+    // (created via the FileStorage offload path).
+    bool HasLocalDiskReplica(const std::string& key);
+
+    // Returns true if the key has a MEMORY replica.
+    bool HasMemoryReplica(const std::string& key);
+
+    // Like Get(), but takes the object size explicitly instead
+    // of extracting it from a memory descriptor. This allows
+    // reading from disk-only replicas where no memory
+    // descriptor exists. Uses Client::Get(key, slices) which
+    // handles routing to memory or disk internally.
+    ErrorCode GetWithExpectedSize(const std::string& key, size_t expected_size,
+                                  std::string& value);
 
    private:
     struct SliceGuard {

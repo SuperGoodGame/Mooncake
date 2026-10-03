@@ -6,8 +6,9 @@ set(MOONCAKE_E2E_TEST_SOURCES
 add_executable(clientctl clientctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(clientctl PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -15,8 +16,9 @@ target_link_libraries(clientctl PUBLIC
 add_executable(e2e_rand_test e2e_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(e2e_rand_test PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -25,8 +27,9 @@ target_link_libraries(e2e_rand_test PUBLIC
 add_executable(chaosctl chaosctl.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaosctl PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -34,8 +37,19 @@ target_link_libraries(chaosctl PUBLIC
 add_executable(client_runner client_runner.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(client_runner PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_executable(oplog_ha_client oplog_ha_client.cpp client_wrapper.cpp)
+target_link_libraries(oplog_ha_client PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -43,8 +57,9 @@ target_link_libraries(client_runner PUBLIC
 add_executable(chaos_test chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaos_test PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -53,9 +68,31 @@ target_link_libraries(chaos_test PUBLIC
 add_executable(chaos_rand_test chaos_rand_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaos_rand_test PUBLIC
     mooncake_store
+    transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
 )
+
+add_executable(storage_backend_e2e_test storage_backend_e2e_test.cpp client_wrapper.cpp)
+target_include_directories(storage_backend_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_link_libraries(storage_backend_e2e_test PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog::glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)
+
+add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp)
+target_link_libraries(oplog_batch_e2e_test PUBLIC glog::glog gtest pthread)
+add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
+set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)

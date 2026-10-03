@@ -26,6 +26,19 @@ struct MetadataStoragePlugin {
     virtual ~MetadataStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) = 0;
+    // Error-aware lookup: same contract as get() but reports whether a
+    // non-found result is an authoritative key absence (kNotFound) or a
+    // transient backend failure (kUnavailable). Plugins that can tell the
+    // two apart (etcd key-absent response, Redis nil reply, HTTP 404 vs 5xx)
+    // must override this; the default delegates to get() and maps any
+    // failure to kUnavailable. Failing closed is deliberate: a plugin that
+    // cannot distinguish absence from an outage must never report kNotFound,
+    // because syncSegmentCache() would then evict a still-live cache entry
+    // on a backend outage.
+    virtual GetResult getWithStatus(const std::string &key,
+                                    Json::Value &value) {
+        return get(key, value) ? GetResult::kFound : GetResult::kUnavailable;
+    }
     virtual bool set(const std::string &key, const Json::Value &value) = 0;
     virtual bool remove(const std::string &key) = 0;
 };
@@ -51,6 +64,8 @@ struct HandShakePlugin {
                      const Json::Value &local, Json::Value &peer) = 0;
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
                            const Json::Value &local, Json::Value &peer) = 0;
+    virtual int sendProbe(std::string ip_or_host_name, uint16_t rpc_port,
+                          const Json::Value &local, Json::Value &peer) = 0;
 
     // Exchange metadata with remote peer.
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
@@ -65,11 +80,14 @@ struct HandShakePlugin {
 
     // Register callback function for receiving metadata exchange request.
     virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) = 0;
+
+    // Register callback function for receiving liveness probe request.
+    virtual void registerOnProbeCallBack(OnReceiveCallBack callback) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();
 
-uint16_t findAvailableTcpPort(int &sockfd);
+uint16_t findAvailableTcpPort(int &sockfd, bool set_range = false);
 
 }  // namespace mooncake
 

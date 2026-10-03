@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <ylt/easylog.hpp>
+
+#include "ascii_string.h"
 
 namespace mooncake {
 class DefaultConfig {
@@ -70,6 +73,18 @@ class DefaultConfig {
                    uint64_t default_value = 0) const;
 
     /**
+     * @brief GetDurationMs retrieves a duration value from the configuration
+     * and converts it to milliseconds.
+     * @param key The key to look up in the configuration
+     * @param val Pointer to store the retrieved value in milliseconds
+     * @param default_value Default value to return if the key is not found
+     * @note Duration strings may use ms, s, m, or h as suffixes. Bare numbers
+     * are interpreted as milliseconds.
+     */
+    void GetDurationMs(const std::string& key, uint64_t* val,
+                       uint64_t default_value = 0) const;
+
+    /**
      * @brief GetDouble retrieves a double value from the configuration
      * @param key The key to look up in the configuration
      * @param val Pointer to store the retrieved value
@@ -109,6 +124,10 @@ class DefaultConfig {
     void GetString(const std::string& key, std::string* val,
                    const std::string& default_value = "") const;
 
+    [[nodiscard]] bool Contains(const std::string& key) const {
+        return data_.find(key) != data_.end();
+    }
+
     void SetPath(const std::string& path) { path_ = path; }
 
    private:
@@ -134,5 +153,35 @@ class DefaultConfig {
     ConfigType type_;
     std::unordered_map<std::string, Node> data_;
 };
+
+// usage: export MC_YLT_LOG_LEVEL=info or export MC_YLT_LOG_LEVEL=debug etc.
+inline void init_ylt_log_level() {
+    const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
+    if (!env_level || !*env_level) {
+        // default is WARN
+        easylog::set_min_severity(easylog::Severity::WARN);
+        return;
+    }
+    const std::string level_str = AsciiToLower(env_level);
+    easylog::Severity severity;
+    if (level_str == "trace") {
+        severity = easylog::Severity::TRACE;
+    } else if (level_str == "debug") {
+        severity = easylog::Severity::DEBUG;
+    } else if (level_str == "info") {
+        severity = easylog::Severity::INFO;
+    } else if (level_str == "warn" || level_str == "warning") {
+        severity = easylog::Severity::WARN;
+    } else if (level_str == "error") {
+        severity = easylog::Severity::ERROR;
+    } else if (level_str == "critical") {
+        severity = easylog::Severity::CRITICAL;
+    } else {
+        // rollback to WARN
+        severity = easylog::Severity::WARN;
+    }
+
+    easylog::set_min_severity(severity);
+}
 
 }  // namespace mooncake

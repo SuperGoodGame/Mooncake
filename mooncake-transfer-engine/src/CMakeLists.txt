@@ -1,93 +1,237 @@
-file(GLOB ENGINE_SOURCES "*.cpp")
-# Exclude rdma_traffic_monitor.cpp and traffic_aware_device_selector.cpp (using external monitor library)
-list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*rdma_traffic_monitor\\.cpp$")
-list(FILTER ENGINE_SOURCES EXCLUDE REGEX ".*traffic_aware_device_selector\\.cpp$")
-
-# Create IMPORTED library for rdma_traffic_monitor
-add_library(rdma_traffic_monitor SHARED IMPORTED GLOBAL)
-set_target_properties(rdma_traffic_monitor PROPERTIES
-    IMPORTED_LOCATION "/home/jiahuawang/test/myfile/monitor/build/librdma_traffic_monitor.so"
-    INTERFACE_INCLUDE_DIRECTORIES "/home/jiahuawang/test/myfile/monitor/include"
-)
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
+set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
+list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
+# ibv_port_attr::active_speed is a uint8_t and reads 0 for XDR (encoding 256);
+# newer rdma-core adds active_speed_ex to carry it. TENT probes the same cache
+# variable in tent/src; this definition covers the classic RdmaContext under
+# transport/ so both decode the port speed the same way.
+include(CheckStructHasMember)
+check_struct_has_member(
+  "struct ibv_port_attr" active_speed_ex infiniband/verbs.h
+  HAVE_IBV_ACTIVE_SPEED_EX LANGUAGE CXX)
+if(HAVE_IBV_ACTIVE_SPEED_EX)
+  add_compile_definitions(HAVE_IBV_ACTIVE_SPEED_EX)
+endif()
 
 add_subdirectory(common)
 add_subdirectory(transport)
 
-SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+# EFA library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-if (BUILD_SHARED_LIBS)
-  install(TARGETS transfer_engine DESTINATION lib)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+if(USE_HIP)
+  hipify_files(ENGINE_SOURCES)
 endif()
 
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
-if (USE_ETCD)
-  if (USE_ETCD_LEGACY)
-    if (USE_STATIC_ETCD_CPP_API)
+add_library(transfer_metadata_plugin OBJECT ${TRANSFER_METADATA_PLUGIN_SOURCES})
+set_target_properties(transfer_metadata_plugin
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  transfer_metadata_plugin
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>)
+target_compile_definitions(transfer_metadata_plugin PRIVATE MOONCAKE_USE_ETCD
+                                                            CMAKE_INCLUDE)
+target_link_libraries(
+  transfer_metadata_plugin
+  PUBLIC glog::glog JsonCpp::JsonCpp
+  PRIVATE pthread)
+if(USE_ETCD)
+  if(USE_ETCD_LEGACY)
+    if(USE_STATIC_ETCD_CPP_API)
       find_package(PkgConfig REQUIRED)
       pkg_check_modules(GRPCPP REQUIRED grpc++)
       pkg_check_modules(GRPC REQUIRED grpc)
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
+      target_link_libraries(
+        transfer_metadata_plugin PRIVATE etcd-cpp-api-core protobuf
+                                         ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
     else()
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
+      target_link_libraries(transfer_metadata_plugin PRIVATE etcd-cpp-api)
     endif()
-  else ()
-    add_dependencies(transfer_engine build_etcd_wrapper)
-    set(ETCD_WRAPPER_LIB ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so)
-    target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
+  else()
+    add_dependencies(transfer_metadata_plugin build_etcd_wrapper)
+    set(ETCD_WRAPPER_LIB
+        ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
+    )
+    target_link_libraries(transfer_metadata_plugin PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
-if (USE_REDIS)
-  target_link_libraries(transfer_engine PUBLIC hiredis)
+if(USE_REDIS)
+  target_link_libraries(transfer_metadata_plugin PRIVATE Mooncake::hiredis)
 endif()
-if (USE_HTTP)
+if(USE_HTTP)
   find_package(CURL REQUIRED)
-  target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
+  target_link_libraries(transfer_metadata_plugin PRIVATE ${CURL_LIBRARIES})
 endif()
 
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+target_include_directories(
+  transfer_engine
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
+target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
+                                                   CMAKE_INCLUDE)
 target_link_libraries(
-    transfer_engine
-    PUBLIC
-    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs
-    rdma_traffic_monitor rt
-    )
+  transfer_engine
+  PUBLIC base
+         rdma_transport
+         rdma_twosided
+         mooncake_common
+         ibverbs
+         glog::glog
+         gflags::gflags
+         pthread
+         JsonCpp::JsonCpp
+         numa
+         asio_shared
+         yalantinglibs::yalantinglibs
+  PRIVATE transport transfer_metadata_plugin)
+if(UNIX AND NOT APPLE)
+  # shm_open/shm_unlink live in librt on glibc; OBJECT-library PRIVATE deps do
+  # not propagate through $<TARGET_OBJECTS:shm_transport>.
+  target_link_libraries(transfer_engine PRIVATE rt)
+endif()
+if(BUILD_SHARED_LIBS)
+  install(TARGETS transfer_engine DESTINATION lib)
+endif()
 
-if (USE_CUDA)
-  target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
-  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
-  if (USE_NVMEOF)
+if(USE_BAREX)
+  target_link_libraries(transfer_engine PUBLIC barex_transport)
+endif()
+
+if(USE_CUDA)
+  target_include_directories(transfer_engine
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  if(USE_CXI)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt)
+  else()
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt mlx5)
+  endif()
+  if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
 endif()
 
-if (USE_MUSA)
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+  target_link_libraries(transfer_engine PUBLIC NCCL::nccl)
+endif()
+
+if(USE_SUPA)
+  target_link_libraries(transfer_engine PUBLIC ${SUPA_LIBRARIES})
+endif()
+
+if(USE_MACA)
+  if(NOT DEFINED MACA_RUNTIME_LIBS)
+    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
+  endif()
+  target_include_directories(transfer_engine PRIVATE ${MACA_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC ${MACA_RUNTIME_LIBS})
+endif()
+
+if(USE_MUSA)
   target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
 endif()
 
-if (USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
+if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
 endif()
 
-if (USE_ASCEND_DIRECT)
-  find_library(
-          FOUND_METADEF
-          NAMES libmetadef.so
-          PATHS ${ASCEND_LIB_DIR}
-          NO_DEFAULT_PATH
-          NO_CMAKE_FIND_ROOT_PATH
-  )
-  if(FOUND_METADEF)
-    message(STATUS "Found library: ${FOUND_METADEF}")
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist metadef)
+if(USE_COREX)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
+if(USE_HIP)
+  target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
+  target_link_libraries(transfer_engine PUBLIC hip::host rt)
+
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
+  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
+  if(USE_HIP_DMABUF)
+    find_package(hsa-runtime64 CONFIG)
+    if(hsa-runtime64_FOUND)
+      # The dmabuf MR-registration code lives in rdma_context.cpp, which is
+      # compiled in the rdma_transport OBJECT library and pulled into
+      # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
+      # transfer_engine never reaches that object compilation, so the dmabuf
+      # path is silently compiled out and GPU MRs fall back to plain ibv_reg_mr
+      # (EINVAL on device memory). Put the define (and the hsa include/link
+      # usage requirements) on the target that actually compiles
+      # rdma_context.cpp.
+      target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
+      target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
+      target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
+      message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
+    else()
+      message(
+        STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+    endif()
   else()
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
+    message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
   endif()
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if(USE_MLU)
+  target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
+endif()
+
+if(USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
+                                               MPI::MPI)
+endif()
+
+if(USE_ASCEND_DIRECT)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+endif()
+
+if(USE_UBSHMEM)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+endif()
+
+if(USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT
+       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
+endif()
+
+if(USE_TENT)
+  add_compile_definitions(transfer_engine PUBLIC USE_TENT)
+  target_link_libraries(transfer_engine PUBLIC tent_link_group)
+endif()
+
+if(USE_INTRA_NVLINK)
+  message(STATUS "Enabled USE_INTRA_NVLINK support")
+  target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+endif()
+
+if(USE_MLX5DV)
+  message(STATUS "Enabled USE_MLX5DV support (mlx5 direct verbs)")
+  target_link_libraries(transfer_engine PUBLIC mlx5)
+endif()
+
+if(USE_EFA)
+  message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
+  target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
+endif()
+if(USE_CXI)
+  message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")
+  target_link_libraries(transfer_engine PUBLIC fabric cxi_transport)
+endif()
+
+if(USE_UB)
+  message(STATUS "Enabled USE_UB protocol support")
+  target_link_libraries(
+    transfer_engine
+    PUBLIC ub_transport
+    PRIVATE ub_allocator)
 endif()

@@ -2,37 +2,70 @@
 
 set -e
 
+source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
+
 # Check for flags
 USE_NVCC=false
+USE_HIPCC=false
+USE_MCC=false
+USE_MACA=false
 CI_BUILD=false
+WITH_HYLINK=false
 
 if [[ "$1" == "--use-nvcc" ]]; then
     USE_NVCC=true
+    shift
+elif [[ "$1" == "--use-hipcc" ]]; then
+    USE_HIPCC=true
+    shift
+elif [[ "$1" == "--use-mcc" ]]; then
+    USE_MCC=true
+    shift
+elif [[ "$1" == "--use-maca" ]]; then
+    USE_MACA=true
     shift
 elif [[ "$1" == "--ci-build" ]]; then
     CI_BUILD=true
     shift
 fi
 
+# Optional feature flags may follow the compiler flag.
+if [[ "$1" == "--with-hylink" ]]; then
+    WITH_HYLINK=true
+    shift
+fi
+
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
 
-echo "Building nvlink allocator to: $OUTPUT_DIR"
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
+prepare_allocator_build_env "$OUTPUT_DIR" "${2:-}"
 
-CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path, under same dir with this script
+echo "Building nvlink allocator to: $OUTPUT_DIR"
+
+CPP_FILE="${SCRIPT_DIR}/nvlink_allocator.cpp"
 
 # Choose build command based on flags
 if [ "$CI_BUILD" = true ]; then
     # CI build: use nvcc without linking cuda
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include ${INCLUDE_FLAGS} -L/usr/local/cuda-12.8/targets/x86_64-linux/lib -lcuda -DUSE_CUDA=1
 elif [ "$USE_NVCC" = true ]; then
     # Regular nvcc build with cuda linking
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
+elif [ "$USE_HIPCC" = true ]; then
+    HIPCC_DEFINES="-DUSE_HIP=1"
+    [ "$WITH_HYLINK" = true ] && HIPCC_DEFINES="$HIPCC_DEFINES -DUSE_HYLINK=1"
+    hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
+    hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} ${HIPCC_DEFINES}
+elif [ "$USE_MCC" = true ]; then
+    mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
+elif [ "$USE_MACA" = true ]; then
+    MACA_ROOT=${MACA_HOME:-/opt/maca}
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC \
+        -I"${MACA_ROOT}/include" ${INCLUDE_FLAGS} \
+        -L"${MACA_ROOT}/lib64" -L"${MACA_ROOT}/lib" -lmcruntime -DUSE_MACA=1
 else
     # Default g++ build
-    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 fi
 
 if [ $? -eq 0 ]; then

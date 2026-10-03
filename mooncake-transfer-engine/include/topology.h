@@ -30,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 
@@ -38,6 +39,8 @@ struct TopologyEntry {
     std::string name;
     std::vector<std::string> preferred_hca;
     std::vector<std::string> avail_hca;
+
+    bool operator==(const TopologyEntry &other) const = default;
 
     Json::Value toJson() const {
         Json::Value matrix(Json::arrayValue);
@@ -66,7 +69,9 @@ class Topology {
 
     bool empty() const;
 
-    void clear();    int discover() {
+    void clear();
+
+    int discover() {
         std::vector<std::string> filter;
         return discover(filter);
     }
@@ -81,20 +86,14 @@ class Topology {
 
     Json::Value toJson() const;
 
+    bool operator==(const Topology &other) const;
+    bool operator!=(const Topology &other) const { return !(*this == other); }
+
     int selectDevice(const std::string storage_type, int retry_count = 0);
     int selectDevice(const std::string storage_type, std::string_view hint,
                      int retry_count = 0);
-
-    // Get all available devices for a given storage type
-    // Returns a vector of device IDs, with preferred devices first
-    std::vector<int> getAvailableDevices(const std::string storage_type) const;
-    
-    // High-performance version: get device lists by reference
-    // Returns true if storage_type found, false otherwise
-    // preferred_devices and avail_devices are filled with device IDs
-    bool getAvailableDevicesRef(const std::string &storage_type,
-                                const std::vector<int>* &preferred_devices,
-                                const std::vector<int>* &avail_devices) const;
+    int selectDeviceByLocalHca(const std::string storage_type,
+                               std::string_view local_hca, int retry_count = 0);
 
     TopologyMatrix getMatrix() const { return matrix_; }
 
@@ -106,6 +105,7 @@ class Topology {
    private:
     TopologyMatrix matrix_;
     std::vector<std::string> hca_list_;
+    bool use_round_robin_;
 
     struct ResolvedTopologyEntry {
         std::vector<int> preferred_hca;
@@ -129,6 +129,10 @@ class Topology {
     };
     std::unordered_map<std::string /* storage type */, ResolvedTopologyEntry>
         resolved_matrix_;
+    std::unordered_map<std::string /* local HCA */,
+                       std::unordered_map<std::string /* storage type */,
+                                          std::vector<int> /* peer HCA ids */>>
+        resolved_hca_peer_affinity_by_local_;
 };
 
 }  // namespace mooncake

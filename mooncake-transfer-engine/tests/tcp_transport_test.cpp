@@ -22,21 +22,14 @@
 #include <iomanip>
 #include <memory>
 
-#ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
-#include <cuda_runtime.h>
-
-#ifdef USE_NVMEOF
+#include "cuda_alike.h"
+#if defined(USE_CUDA) && defined(USE_NVMEOF)
 #include <cufile.h>
 #endif
-#endif
 
-#ifdef USE_MUSA
-#include <bits/stdint-uintn.h>
-#include <musa_porting.h>
-#endif
-
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
 #include <cassert>
 #include "common/base/status.h"
 
@@ -52,7 +45,9 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
+    defined(USE_SUPA)
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 

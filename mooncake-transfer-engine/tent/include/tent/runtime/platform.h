@@ -1,0 +1,88 @@
+// Copyright 2024 KVCache.AI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef PLATFORM_H
+#define PLATFORM_H
+
+#include "tent/runtime/topology.h"
+
+namespace mooncake {
+namespace tent {
+
+// New device memory types are appended last so the numeric values of the
+// existing entries are preserved. TPU HBM and Intel XPU VRAM are not
+// NIC-addressable in the MVP, so transfers touching them are staged through
+// host DRAM by ProxyManager (see findStagingPolicy). Any device memory type
+// added here must also be reported by isGpuMemoryType() below, so the
+// selector's routing predicate and the staging capability checks stay in
+// agreement.
+enum MemoryType {
+    MTYPE_UNKNOWN,
+    MTYPE_CPU,
+    MTYPE_CUDA,
+    MTYPE_ROCM,
+    MTYPE_TPU,
+    MTYPE_XPU
+};
+
+// Single source of truth for "is this a device (GPU/NPU/TPU/XPU) memory type?".
+// Both the selector's routing predicate and the staging capability checks
+// consult this, so a device memory type can never be classified as a device on
+// one path and as host on the other. Device types stage their device<->host hop
+// through the matching transport (gpu_to_dram / dram_to_gpu) and never satisfy
+// gpu_to_gpu in the MVP.
+inline bool isGpuMemoryType(MemoryType t) {
+    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU ||
+           t == MTYPE_XPU;
+}
+
+class Platform {
+   public:
+    static Platform &getLoader(std::shared_ptr<Config> conf = nullptr);
+
+    Platform() {}
+
+    virtual ~Platform() {}
+
+    virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
+                         std::vector<Topology::MemEntry> &mem_list) = 0;
+
+    virtual Status allocate(void **pptr, size_t size,
+                            MemoryOptions &options) = 0;
+
+    virtual Status free(void *ptr, size_t size) = 0;
+
+    virtual Status copy(void *dst, void *src, size_t length) = 0;
+
+    virtual MemoryType getMemoryType(void *addr) = 0;
+
+    virtual const std::vector<RangeLocation> getLocation(
+        void *start, size_t len, bool skip_prefault = false) = 0;
+
+    virtual const std::string type() const = 0;
+
+    // Make GPUDirect / device DMA visible on devices named in `topology`.
+    // GPU platforms flush those devices; CPU and others no-op. Failures are
+    // logged and still return OK so teardown can continue.
+    virtual Status synchronizeDevices(const Topology *topology);
+
+   protected:
+    static std::vector<int> topologyDeviceIndices(const Topology *topology,
+                                                  Topology::MemType mem_type);
+};
+
+}  // namespace tent
+}  // namespace mooncake
+
+#endif  // PLATFORM_H

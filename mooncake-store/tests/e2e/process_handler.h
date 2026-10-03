@@ -2,8 +2,11 @@
 
 #include <sys/types.h>
 
+#include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mooncake {
 namespace testing {
@@ -20,6 +23,19 @@ inline const char* const TEST_MOUNT_SUCCESS_STR = "[TEST_MOUNT_SUCCESS]";
 inline const char* const TEST_MOUNT_FAILURE_STR = "[TEST_MOUNT_FAILURE]";
 inline const char* const TEST_UNMOUNT_SUCCESS_STR = "[TEST_UNMOUNT_SUCCESS]";
 inline const char* const TEST_UNMOUNT_FAILURE_STR = "[TEST_UNMOUNT_FAILURE]";
+
+struct MasterRunnerConfig {
+    bool enable_ha = true;
+    std::string ha_backend_type = "etcd";
+    std::string ha_backend_connstring;
+    std::string etcd_endpoints;
+    std::string cluster_id{};
+    std::string oplog_store_type{};
+    uint32_t metrics_port{0};
+    uint32_t oplog_batch_max_entries{1024};
+    uint32_t batch_oplog_retry_timeout_sec{180};
+    std::vector<std::string> extra_args{};
+};
 
 /**
  * @brief A wrapper for the master process.
@@ -40,6 +56,9 @@ class MasterProcessHandler {
     MasterProcessHandler(const std::string& path,
                          const std::string& etcd_endpoints, const int port,
                          const int index, const std::string& out_dir);
+    MasterProcessHandler(const std::string& path,
+                         const MasterRunnerConfig& config, const int port,
+                         const int index, const std::string& out_dir);
     ~MasterProcessHandler();
 
     // Delete copy constructor and assignment operator
@@ -56,16 +75,23 @@ class MasterProcessHandler {
     // Kill the master process.
     bool kill();
 
+    bool stop(std::chrono::milliseconds timeout);
+    bool signal(int signo);
+    bool wait_for_exit(std::chrono::milliseconds timeout, int* status);
+    pid_t pid() const { return master_pid_; }
+    const std::string& stdout_path() const { return stdout_path_; }
+    const std::string& stderr_path() const { return stderr_path_; }
+
     // Check if the process is started and is not killed yet.
     bool is_running() const;
 
    private:
     // The PID of the master process.
-    pid_t master_pid_{0};
+    mutable pid_t master_pid_{0};
     // The path to the master executable.
     std::string master_path_;
-    // The etcd endpoints.
-    std::string etcd_endpoints_;
+    // The startup configuration for the master process.
+    MasterRunnerConfig config_;
     // The port of the master process.
     int port_;
     // The index of the master, used to name the log file.
@@ -74,6 +100,8 @@ class MasterProcessHandler {
     bool first_start_{true};
     // The directory to store the log files.
     std::string out_dir_;
+    std::string stdout_path_;
+    std::string stderr_path_;
 };
 
 /**
@@ -126,18 +154,27 @@ class ClientProcessHandler {
     // Kill the client process.
     bool kill();
 
+    bool stop(std::chrono::milliseconds timeout);
+    bool signal(int signo);
+    bool wait_for_exit(std::chrono::milliseconds timeout, int* status);
+    pid_t pid() const { return client_pid_; }
+    const std::string& stdout_path() const { return stdout_path_; }
+    const std::string& stderr_path() const { return stderr_path_; }
+
     // Check if the process is started and is not killed yet.
     bool is_running() const;
 
    private:
     // The PID of the client process.
-    pid_t client_pid_{0};
+    mutable pid_t client_pid_{0};
     // The path to the client executable.
     std::string client_path_;
     // The index of the client, used for log.
     int index_;
     // The directory to store the log files.
     std::string out_dir_;
+    std::string stdout_path_;
+    std::string stderr_path_;
     // The start parameters for the client runner.
     ClientRunnerConfig config_;
     // Whether the client is started for the first time.

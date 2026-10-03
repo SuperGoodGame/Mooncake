@@ -2,12 +2,27 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <memory>
-#include <string>
-#include <random>
+#include <algorithm>
 #include <barrier>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fcntl.h>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <random>
+#include <string>
+#include <thread>
+#include <unistd.h>
 
-#include "pybind_client.h"
+#ifdef MOONCAKE_TEST_CUDA_H2D
+#include <cuda_runtime_api.h>
+#endif
+
+#include "config.h"
+#include "real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -16,10 +31,67 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 namespace mooncake {
 namespace testing {
 
-class PyClientTest : public ::testing::Test {
+// Helper class to temporarily mute glog output by setting log level to FATAL
+class GLogMuter {
+   public:
+    GLogMuter() : original_log_level_(FLAGS_minloglevel) {
+        FLAGS_minloglevel = google::GLOG_FATAL;
+    }
+
+    ~GLogMuter() { FLAGS_minloglevel = original_log_level_; }
+
+   private:
+    int original_log_level_;
+};
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* previous = getenv(name)) previous_ = previous;
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_) {
+            setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_;
+};
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t max_mr_size)
+        : old_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = old_max_mr_size_; }
+
+   private:
+    size_t old_max_mr_size_;
+};
+
+TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
+    constexpr size_t kMaxMrSize = 64 * 1024 * 1024;
+    ScopedMaxMrSize limit(kMaxMrSize);
+
+    EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
+    EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
+    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
+
+class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("PyClientTest");
+        google::InitGoogleLogging("RealClientTest");
         FLAGS_logtostderr = 1;
     }
 
@@ -34,26 +106,689 @@ class PyClientTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata: P2PHANDSHAKE";
 
-        py_client_ = PyClient::create();
+        py_client_ = RealClient::create();
     }
 
     void TearDown() override {
         if (py_client_) {
             py_client_->tearDownAll();
+            if (!ssd_path_.empty()) py_client_.reset();
         }
 
         master_.Stop();
+        if (!ssd_path_.empty()) std::filesystem::remove_all(ssd_path_);
     }
 
-    std::shared_ptr<PyClient> py_client_;
+    std::shared_ptr<RealClient> py_client_;
 
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
+    std::string ssd_path_;
+
+    void StartMasterAndSetupClient() {
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+            << "Failed to start in-proc master";
+        master_address_ = master_.master_address();
+
+        const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                             ? FLAGS_device_name
+                                             : std::string("");
+        ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                         16 * 1024 * 1024, 16 * 1024 * 1024,
+                                         FLAGS_protocol, rdma_devices,
+                                         master_address_),
+                  0);
+    }
+
+    ConfigDict MakeConfigDict(const std::string& local_hostname,
+                              const std::string& global_segment_size,
+                              const std::string& local_buffer_size) const {
+        const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                             ? FLAGS_device_name
+                                             : std::string("");
+        ConfigDict config;
+        config[CONFIG_KEY_LOCAL_HOSTNAME] = local_hostname;
+        config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+        config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = global_segment_size;
+        config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = local_buffer_size;
+        config[CONFIG_KEY_PROTOCOL] = FLAGS_protocol;
+        config[CONFIG_KEY_RDMA_DEVICES] = rdma_devices;
+        config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+        return config;
+    }
+
+    std::string CreateTempSegmentFile(size_t size) {
+        std::string path = "/tmp/mooncake_real_client_segment_XXXXXX";
+        int fd = mkstemp(path.data());
+        EXPECT_GE(fd, 0) << "Failed to create temp segment file";
+        if (fd < 0) {
+            return "";
+        }
+        EXPECT_EQ(ftruncate(fd, size), 0)
+            << "Failed to resize temp segment file";
+        close(fd);
+        return path;
+    }
 };
 
+TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t object_size = 16;
+    auto make_local_disk = [object_size](const std::string& endpoint,
+                                         ReplicaStatus status) {
+        Replica::Descriptor replica;
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = object_size;
+        descriptor.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = status;
+        return replica;
+    };
+
+    struct TestCase {
+        std::string name;
+        std::vector<Replica::Descriptor> replicas;
+        std::string expected_endpoint;
+    };
+    std::vector<TestCase> test_cases;
+    // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
+    // descriptor. Both list orders make a first-vs-last mismatch observable.
+    test_cases.push_back(
+        {.name = "a_then_b",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-b", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-b"});
+    test_cases.push_back(
+        {.name = "b_then_a",
+         .replicas = {make_local_disk("endpoint-b", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a"});
+    test_cases.push_back(
+        {.name = "not_ready_then_complete",
+         .replicas = {make_local_disk("endpoint-not-ready",
+                                      ReplicaStatus::PROCESSING),
+                      make_local_disk("endpoint-complete",
+                                      ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-complete"});
+
+    for (auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+        query_results.emplace_back(QueryResult(
+            std::move(test_case.replicas),
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+
+        std::vector<char> destination(object_size);
+        std::string visited_endpoint;
+        // Stop at the offload RPC boundary after recording its destination.
+        // The injected error also prevents checksum verification of the
+        // intentionally untouched destination buffer.
+        auto local_disk_reader = [&visited_endpoint](
+                                     const std::string& endpoint,
+                                     RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            visited_endpoint = endpoint;
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                {"endpoint-selection-key"}, {destination.data()},
+                {destination.size()}, query_results, local_disk_reader);
+        }
+
+        EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+}
+
+TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17824";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    const std::string key = "session_dfs";
+    std::string source(kObjectSize, '\0');
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 7) % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    const auto dfs_descriptor = replicas.front().get_dfs_descriptor();
+
+    std::string first(512, '\0');
+    std::string second(777, '\0');
+    ASSERT_EQ(py_client_->register_buffer(first.data(), first.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(second.data(), second.size()), 0);
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{127}});
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(
+                           toInt(ErrorCode::NO_AVAILABLE_HANDLE))});
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data(), second.data()}}, {{first.size(), second.size()}},
+        {{127, 2048}});
+    ASSERT_EQ(results,
+              std::vector<int>{static_cast<int>(first.size() + second.size())});
+    EXPECT_EQ(first, source.substr(127, first.size()));
+    EXPECT_EQ(second, source.substr(2048, second.size()));
+
+    std::filesystem::resize_file(dfs_descriptor.file_path,
+                                 dfs_descriptor.offset + kObjectSize / 2);
+    results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{first.data()}}, {{first.size()}}, {{0}});
+    ASSERT_EQ(results.size(), 1);
+    EXPECT_EQ(results[0], static_cast<int>(toInt(ErrorCode::FILE_READ_FAIL)));
+
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(first.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(second.data()), 0);
+}
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_gpu_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kSourceOffset = 257;
+    constexpr size_t kRangeSize = 1024;
+    const std::string key = "session_dfs_gpu";
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    // Remove the fallback allocator so success proves that device-targeted DFS
+    // staging came from the pinned restore arena.
+    auto fallback_allocator = std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{gpu_destination}}, {{kRangeSize}}, {{kSourceOffset}});
+    py_client_->client_buffer_allocator_ = std::move(fallback_allocator);
+
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(kRangeSize)});
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+}
+
+TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar cache_size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576");
+    ScopedEnvVar block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    ScopedEnvVar shared_cache("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    ScopedEnvVar admission("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "snapshot_gpu_hot_cache";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    // Populate the key-based cache with the new value after taking the old
+    // snapshot. Keep the read buffer alive until the async cache fill
+    // completes.
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+    bool cache_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (py_client_->acquire_hot_cache(key).has_value()) {
+            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+            cache_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache_ready);
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, original.size()), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(py_client_->register_buffer(destination, original.size()), 0);
+    registered = true;
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination}, {{key}}, {{{0}}}, {{{0}}},
+                  {{{original.size()}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{32}}}));
+    std::string actual(original.size(), '\0');
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, original);
+}
+
+TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_pinned_restore_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 64 * 1024;
+    constexpr size_t kSourceOffset = 8 * 1024;
+    constexpr size_t kRangeSize = 16 * 1024;
+    static_assert(kSourceOffset + kRangeSize < kObjectSize);
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "pinned_ssd_non_tail_range";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+            }
+        }
+        if (!disk_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(disk_ready);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) {
+            EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        }
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    const auto reads_before = py_client_->get_offload_rpc_read_count();
+    auto results =
+        py_client_->get_into_ranges({gpu_destination}, {{key}}, {{{0}}},
+                                    {{{kSourceOffset}}}, {{{kRangeSize}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    ASSERT_EQ(results[0][0].size(), 1);
+    EXPECT_EQ(results[0][0][0], static_cast<int64_t>(kRangeSize));
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), reads_before + 1);
+
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+}
+#endif
+
+TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    EXPECT_EQ(allocated_size, slab_size);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+
+    segment_ids.clear();
+    allocated_size = 0;
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(slab_size + 1, FLAGS_protocol, "",
+                                            segment_ids, &allocated_size),
+        0);
+    EXPECT_EQ(allocated_size, slab_size * 2);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, TcpSetupDoesNotSplitAtMaxMrSize) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(2 * slab_size);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE", 6 * slab_size,
+                               0, "tcp", "", master_address_),
+        0);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 6 * slab_size);
+}
+
+TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17815", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "efa", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 2u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 2u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 4u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 3 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17816", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 1u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 2u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 6 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+
+    EXPECT_NE(py_client_->allocateAndMountSegment(
+                  std::numeric_limits<size_t>::max(), FLAGS_protocol, "",
+                  segment_ids, &allocated_size),
+              0);
+    EXPECT_TRUE(segment_ids.empty());
+    EXPECT_EQ(allocated_size, 0);
+}
+
+TEST_F(RealClientTest, AllocateAndMountSegmentFreesOnTearDown) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> segment_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(1, FLAGS_protocol, "",
+                                                  segment_ids, &allocated_size),
+              0);
+    ASSERT_FALSE(segment_ids.empty());
+    EXPECT_GT(allocated_size, 0);
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+
+    GLogMuter muter;
+    EXPECT_NE(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, MountAndAllocateUnmountApisRejectForeignSegments) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> allocated_segment_ids;
+    size_t allocated_size = 0;
+
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(
+            1, FLAGS_protocol, "", allocated_segment_ids, &allocated_size),
+        0);
+    ASSERT_FALSE(allocated_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountSegment(allocated_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_segment_ids), 0);
+
+    std::string path = CreateTempSegmentFile(slab_size);
+    ASSERT_FALSE(path.empty());
+
+    std::vector<std::string> mounted_segment_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, slab_size, FLAGS_protocol, "",
+                                       mounted_segment_ids),
+              0);
+    ASSERT_FALSE(mounted_segment_ids.empty());
+    EXPECT_NE(py_client_->unmountAndFreeSegment(mounted_segment_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_segment_ids), 0);
+
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, MountAndAllocateUnmountApisAcceptGracePeriod) {
+    StartMasterAndSetupClient();
+
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    std::vector<std::string> allocated_segment_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(
+        py_client_->allocateAndMountSegment(
+            1, FLAGS_protocol, "", allocated_segment_ids, &allocated_size),
+        0);
+    ASSERT_FALSE(allocated_segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_segment_ids, 1), 0);
+
+    std::string path = CreateTempSegmentFile(slab_size);
+    ASSERT_FALSE(path.empty());
+
+    std::vector<std::string> mounted_segment_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, slab_size, FLAGS_protocol, "",
+                                       mounted_segment_ids),
+              0);
+    ASSERT_FALSE(mounted_segment_ids.empty());
+    EXPECT_EQ(py_client_->unmountSegment(mounted_segment_ids, 1), 0);
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
 // Test basic Put and Get operations
-TEST_F(PyClientTest, BasicPutGetOperations) {
+TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -64,13 +799,14 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
-    const std::string test_data = "Hello, PyClient!";
-    const std::string key = "test_key_pyclient";
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
@@ -97,10 +833,109 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
     EXPECT_EQ(exist_result, 1) << "Key should exist";
 }
 
+TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "local_buffer_subrange_key";
+    const std::string test_data = "shared-local-buffer-read";
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    auto local_alloc =
+        py_client_->client_buffer_allocator_->allocate(test_data.size() + 32);
+    ASSERT_TRUE(local_alloc.has_value());
+    BufferHandle handle = std::move(*local_alloc);
+    auto* dst = static_cast<char*>(handle.ptr()) + 16;
+    std::memset(handle.ptr(), 0, handle.size());
+
+    auto bytes_read = py_client_->get_into(key, dst, test_data.size());
+    ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
+    EXPECT_EQ(std::string(dst, test_data.size()), test_data);
+}
+
+TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_upsert";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&](size_t offset, size_t size) {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
+            {{{size}}}, snapshot);
+    };
+
+    // Pause between prefix and payload, then replace the same-size object.
+    EXPECT_EQ(read(0, 4),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    EXPECT_EQ(read(4, 28),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
+              original);
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_expired";
+    const std::string data(32, 'A');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(data)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(
+        key, QueryResult(
+                 std::vector<Replica::Descriptor>(queries[0]->replicas),
+                 std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    auto destination = py_client_->allocate_client_buffer(data.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&]() {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+    };
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
+    // The existing cache API still allows refresh for independent reads.
+    EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
+                                          {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    snapshot.clear();
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}}}));
+    snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
+}
+
 // Test Get Operation will fail if the lease has expired.
 // Set the lease time to 1ms and use large data size to ensure the lease will
 // expire.
-TEST_F(PyClientTest, GetWithLeaseTimeOut) {
+TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
@@ -113,10 +948,11 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                512 * 1024 * 1024, 512 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               512 * 1024 * 1024, 512 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
@@ -127,7 +963,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 
     // Test Single Get Operation
     {
-        const std::string key = "test_key_pyclient";
+        const std::string key = "test_key_realclient";
 
         // Put the data
         std::span<const char> data_span(test_data.data(), test_data.size());
@@ -181,7 +1017,11 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
         EXPECT_EQ(batch_put_result, 0) << "Batch put operation should succeed";
 
         // Test Batch Get operation using batch_get_buffer
-        auto buffer_handles = py_client_->batch_get_buffer(keys);
+        std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
+        {
+            GLogMuter muter;
+            buffer_handles = py_client_->batch_get_buffer(keys);
+        }
         ASSERT_EQ(buffer_handles.size(), num_slices)
             << "Should return handles for all keys";
         int fail_count = 0;
@@ -190,13 +1030,18 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
                 fail_count++;
             }
         }
+
         LOG(INFO) << "Batch get buffer " << fail_count << " out of "
                   << num_slices << " keys failed";
         ASSERT_NE(fail_count, 0) << "Should fail for some keys";
 
         // Test Batch Get operation using batch_get_into
-        auto bytes_read_results =
-            py_client_->batch_get_into(keys, buffers, sizes);
+        std::vector<int64_t> bytes_read_results;
+        {
+            GLogMuter muter;
+            bytes_read_results =
+                py_client_->batch_get_into(keys, buffers, sizes);
+        }
         ASSERT_EQ(bytes_read_results.size(), num_slices)
             << "Should return results for all keys";
         fail_count = 0;
@@ -221,7 +1066,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 }
 
 // Concurrent Put and Get and check if will get wrong data.
-TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
+TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     const size_t segment_size = 16 * 1024 * 1024;
@@ -235,9 +1080,9 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE", segment_size,
-                                segment_size, FLAGS_protocol, rdma_devices,
-                                master_address_),
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     segment_size, segment_size, FLAGS_protocol,
+                                     rdma_devices, master_address_),
               0);
 
     // Test Single Get Operation with Concurrent Put
@@ -245,6 +1090,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each repeatedly putting their slice
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
@@ -348,6 +1195,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each putting multiple slices
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
@@ -462,6 +1311,1840 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         py_client_->removeAll();
     }
 }
+
+TEST_F(RealClientTest, TestSetupExistTransferEngine) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
+
+    // The auto discover has some problems in GitHub CI, so disable it here.
+    transfer_engine->setAutoDiscover(false);
+    auto init_ret = transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+    ASSERT_EQ(init_ret, 0) << "Transfer engine initialization should succeed";
+    if (FLAGS_protocol == "tcp") {
+        auto transport = transfer_engine->installTransport("tcp", nullptr);
+        ASSERT_NE(transport, nullptr) << "Install transport should succeed";
+    } else {
+        ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
+    }
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, rdma_devices,
+                                     master_address_, transfer_engine),
+              0);
+
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
+
+    // Test Put operation using span
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    int put_result = py_client_->put(key, data_span, config);
+    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+}
+
+TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    std::string test_data(1000, '1');
+    std::string upsert_data(1000, '2');
+    std::string dst_data(1000, '0');
+
+    // Register buffers for zero-copy operations
+    int reg_result_test =
+        py_client_->register_buffer(test_data.data(), test_data.size());
+    ASSERT_EQ(reg_result_test, 0)
+        << "Test data buffer registration should succeed";
+    int reg_result_dst =
+        py_client_->register_buffer(dst_data.data(), dst_data.size());
+    ASSERT_EQ(reg_result_dst, 0)
+        << "Dst data buffer registration should succeed";
+    int reg_result_upsert =
+        py_client_->register_buffer(upsert_data.data(), upsert_data.size());
+    ASSERT_EQ(reg_result_upsert, 0)
+        << "Upsert data buffer registration should succeed";
+
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_upsert_ptrs;
+    std::vector<std::vector<void*>> all_dst_ptrs;
+    std::vector<std::vector<size_t>> all_sizes;
+    auto ptr = test_data.data();
+    auto upsert_ptr = upsert_data.data();
+    auto dst_ptr = dst_data.data();
+    for (size_t i = 0; i < 10; i++) {
+        keys.emplace_back("test_key_" + std::to_string(i));
+        std::vector<void*> ptrs;
+        std::vector<void*> upsert_ptrs;
+        std::vector<void*> dst_ptrs;
+        std::vector<size_t> sizes;
+        for (size_t j = 0; j < 10; j++) {
+            ptrs.emplace_back(ptr);
+            upsert_ptrs.emplace_back(upsert_ptr);
+            dst_ptrs.emplace_back(dst_ptr);
+            sizes.emplace_back(10);
+            ptr += 10;
+            upsert_ptr += 10;
+            dst_ptr += 10;
+        }
+        all_ptrs.emplace_back(ptrs);
+        all_upsert_ptrs.emplace_back(upsert_ptrs);
+        all_dst_ptrs.emplace_back(dst_ptrs);
+        all_sizes.emplace_back(sizes);
+    }
+
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = true;
+    std::vector<int> results = py_client_->batch_put_from_multi_buffers(
+        keys, all_ptrs, all_sizes, config);
+    for (auto result : results) {
+        EXPECT_EQ(result, 0) << "Put operation should succeed";
+    }
+    std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
+        keys, all_dst_ptrs, all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get operation should succeed";
+    }
+    EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
+
+    std::vector<int> upsert_results =
+        py_client_->batch_upsert_from_multi_buffers(keys, all_upsert_ptrs,
+                                                    all_sizes, config);
+    for (auto result : upsert_results) {
+        EXPECT_EQ(result, 0) << "Upsert operation should succeed";
+    }
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    get_results = py_client_->batch_get_into_multi_buffers(keys, all_dst_ptrs,
+                                                           all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get after upsert should succeed";
+    }
+    EXPECT_EQ(dst_data, upsert_data)
+        << "Retrieved data should match upserted data";
+
+    // Unregister buffers
+    int unreg_result_test = py_client_->unregister_buffer(test_data.data());
+    ASSERT_EQ(unreg_result_test, 0)
+        << "Test data buffer unregistration should succeed";
+    int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
+    ASSERT_EQ(unreg_result_dst, 0)
+        << "Dst data buffer unregistration should succeed";
+    int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
+    ASSERT_EQ(unreg_result_upsert, 0)
+        << "Upsert data buffer unregistration should succeed";
+}
+
+TEST_F(RealClientTest, TestPutGetSessionRanges) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kNumLayers = 4;
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = kPageSize * kNumLayers;
+    constexpr size_t kNumKeys = 3;
+
+    std::string src_data(kObjectSize * kNumKeys, 'A');
+    std::string dst_data(kObjectSize * kNumKeys, 'B');
+    for (size_t i = 0; i < src_data.size(); ++i) {
+        src_data[i] = static_cast<char>('a' + (i % 26));
+    }
+
+    ASSERT_EQ(py_client_->register_buffer(src_data.data(), src_data.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst_data.data(), dst_data.size()), 0);
+
+    std::vector<std::string> keys;
+    std::vector<size_t> object_sizes;
+    keys.reserve(kNumKeys);
+    object_sizes.reserve(kNumKeys);
+    for (size_t i = 0; i < kNumKeys; ++i) {
+        keys.push_back("session_key_" + std::to_string(i));
+        object_sizes.push_back(kObjectSize);
+    }
+
+    auto put_start_rcs =
+        py_client_->batch_put_session_start(keys, object_sizes);
+    ASSERT_EQ(put_start_rcs.size(), kNumKeys);
+    for (auto rc : put_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_dst_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                src_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_dst_offsets[i] = {layer * kPageSize};
+        }
+        auto put_rcs = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_dst_offsets);
+        ASSERT_EQ(put_rcs.size(), kNumKeys);
+        for (auto rc : put_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    auto put_end_rcs = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(put_end_rcs.size(), kNumKeys);
+    for (auto rc : put_end_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_put_session_end should succeed";
+    }
+
+    auto get_start_rcs = py_client_->batch_get_session_start(keys);
+    ASSERT_EQ(get_start_rcs.size(), kNumKeys);
+    for (auto rc : get_start_rcs) {
+        EXPECT_EQ(rc, 0) << "batch_get_session_start should succeed";
+    }
+
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
+        std::vector<std::vector<void*>> all_buffers(kNumKeys);
+        std::vector<std::vector<size_t>> all_sizes(kNumKeys);
+        std::vector<std::vector<size_t>> all_src_offsets(kNumKeys);
+        for (size_t i = 0; i < kNumKeys; ++i) {
+            char* layer_ptr =
+                dst_data.data() + i * kObjectSize + layer * kPageSize;
+            all_buffers[i] = {layer_ptr};
+            all_sizes[i] = {kPageSize};
+            all_src_offsets[i] = {layer * kPageSize};
+        }
+        auto get_rcs = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, all_buffers, all_sizes, all_src_offsets);
+        ASSERT_EQ(get_rcs.size(), kNumKeys);
+        for (auto rc : get_rcs) {
+            EXPECT_EQ(rc, static_cast<int>(kPageSize));
+        }
+    }
+
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dst_data, src_data);
+
+    // Revoke path: start then revoke without end.
+    std::vector<std::string> revoke_keys = {"session_revoke_0"};
+    std::vector<size_t> revoke_sizes = {kObjectSize};
+    auto revoke_start =
+        py_client_->batch_put_session_start(revoke_keys, revoke_sizes);
+    ASSERT_EQ(revoke_start.size(), 1);
+    EXPECT_EQ(revoke_start[0], 0);
+    auto revoke_rcs = py_client_->batch_put_session_revoke(revoke_keys);
+    ASSERT_EQ(revoke_rcs.size(), 1);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    auto missing = py_client_->batch_get_session_start(revoke_keys);
+    ASSERT_EQ(missing.size(), 1);
+    EXPECT_LT(missing[0], 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src_data.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst_data.data()), 0);
+}
+
+// Issue #3658: read SSD-only keys through a separate TCP client.
+TEST_F(RealClientTest, TestGetSessionRangesFromSsdOffload) {
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+    char path[] = "/tmp/mooncake_ssd_session_XXXXXX";
+    ASSERT_NE(mkdtemp(path), nullptr);
+    ssd_path_ = path;
+    constexpr int kLeaseMs = 1000;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(kLeaseMs)
+                                  .build()));
+    master_address_ = master_.master_address();
+    const std::string owner = "localhost:17822";
+    ASSERT_EQ(py_client_->setup_real(
+                  owner, "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+                  "tcp", "", master_address_, nullptr, "", true, ssd_path_),
+              0);
+    auto reader = RealClient::create();
+    ASSERT_EQ(reader->setup_real("localhost:17823", "P2PHANDSHAKE", 0, 0, "tcp",
+                                 "", master_address_),
+              0);
+
+    constexpr size_t kPageSize = 64;
+    constexpr size_t kObjectSize = 4 * kPageSize;
+    const std::vector<std::string> keys = {"session_ssd_0", "session_ssd_1",
+                                           "session_memory"};
+    std::string src(kObjectSize * keys.size(), '\0');
+    std::string dst(src.size(), 'Z');
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = static_cast<char>(i % 251);
+    }
+    ASSERT_EQ(reader->register_buffer(dst.data(), dst.size()), 0);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ASSERT_EQ(py_client_->put(
+                      keys[i], std::span<const char>(
+                                   src.data() + i * kObjectSize, kObjectSize)),
+                  0);
+    }
+
+    const std::vector<std::string> ssd_keys(keys.begin(), keys.begin() + 2);
+    for (const auto& key : ssd_keys) {
+        bool ready = false;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!ready && std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(key)) {
+                ready |= replica.is_local_disk_replica() &&
+                         replica.status == ReplicaStatus::COMPLETE;
+            }
+            if (!ready)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        ASSERT_TRUE(ready) << key;
+    }
+    // Querying above granted a lease; wait for it before clearing MEMORY.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    ASSERT_EQ(py_client_->batch_replica_clear(ssd_keys, owner).size(),
+              ssd_keys.size());
+    for (const auto& key : ssd_keys) {
+        const auto replicas = py_client_->get_replica_desc(key);
+        ASSERT_EQ(replicas.size(), 1u);
+        ASSERT_TRUE(replicas.front().is_local_disk_replica());
+    }
+    ASSERT_EQ(reader->batch_get_session_start(keys), std::vector<int>(3, 0));
+
+    auto read_ranges = [&](const std::vector<size_t>& offsets,
+                           const std::vector<size_t>& sizes) {
+        std::fill(dst.begin(), dst.end(), 'Z');
+        std::string expected(dst);
+        std::vector<std::vector<void*>> buffers(keys.size());
+        size_t total = 0;
+        for (size_t j = 0; j < sizes.size(); ++j) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                buffers[i].push_back(dst.data() + i * kObjectSize + total);
+                expected.replace(i * kObjectSize + total, sizes[j], src,
+                                 i * kObjectSize + offsets[j], sizes[j]);
+            }
+            total += sizes[j];
+        }
+        const auto before = reader->get_offload_rpc_read_count();
+        EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                      keys, buffers,
+                      std::vector<std::vector<size_t>>(keys.size(), sizes),
+                      std::vector<std::vector<size_t>>(keys.size(), offsets)),
+                  std::vector<int>(keys.size(), total));
+        EXPECT_EQ(reader->get_offload_rpc_read_count(), before + 1);
+        EXPECT_EQ(dst, expected);
+    };
+    read_ranges({0, kPageSize, 2 * kPageSize, 3 * kPageSize},
+                {kPageSize, kPageSize, kPageSize, kPageSize});
+    read_ranges({kPageSize}, {kPageSize});            // Non-tail partial read.
+    read_ranges({2 * kPageSize, 7, 9}, {16, 16, 8});  // Unordered, overlapping.
+
+    // Repeated SSD keys must fill each destination without duplicate reads.
+    const auto before_duplicate = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[0]}, {{dst.data()}, {dst.data() + kPageSize}},
+                  {{kPageSize}, {kPageSize}}, {{0}, {2 * kPageSize}}),
+              std::vector<int>(2, kPageSize));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_duplicate + 1);
+    EXPECT_EQ(dst.substr(0, kPageSize), src.substr(0, kPageSize));
+    EXPECT_EQ(dst.substr(kPageSize, kPageSize),
+              src.substr(2 * kPageSize, kPageSize));
+
+    // Invalid entries must not prevent valid entries in the batch from reading.
+    const int invalid = static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges(
+            keys, {{dst.data()}, {dst.data()}, {dst.data() + kObjectSize}},
+            {{kPageSize}, {kPageSize}, {kPageSize}},
+            {{std::numeric_limits<size_t>::max()}, {0}, {kObjectSize}}),
+        (std::vector<int>{invalid, kPageSize, invalid}));
+    const auto before_empty = reader->get_offload_rpc_read_count();
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[1]}, {{}, {nullptr}}, {{}, {1}}, {{}, {0}}),
+              (std::vector<int>{0, invalid}));
+    EXPECT_EQ(reader->get_offload_rpc_read_count(), before_empty);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseMs + 50));
+    EXPECT_EQ(
+        reader->batch_get_into_multi_buffer_ranges({keys[0]}, {{dst.data()}},
+                                                   {{1}}, {{0}}),
+        (std::vector<int>{static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED))}));
+    EXPECT_EQ(reader->batch_get_session_end(keys), 0);
+    EXPECT_EQ(reader->batch_get_into_multi_buffer_ranges(
+                  {keys[1]}, {{dst.data()}}, {{1}}, {{0}}),
+              (std::vector<int>{invalid}));
+    ASSERT_EQ(reader->unregister_buffer(dst.data()), 0);
+    EXPECT_EQ(reader->tearDownAll(), 0);
+}
+
+// Abnormal put/get session cases. See check table in PR / review notes.
+TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17815", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kPage = 64;
+    constexpr size_t kObjectSize = kPage * 2;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string buf(kObjectSize, 'x');
+    ASSERT_EQ(py_client_->register_buffer(buf.data(), buf.size()), 0);
+
+    EXPECT_TRUE(py_client_->batch_get_session_start({}).empty());
+    EXPECT_TRUE(
+        py_client_->batch_get_into_multi_buffer_ranges({}, {}, {}, {}).empty());
+    EXPECT_EQ(py_client_->batch_get_session_end({}), 0);
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  {"outer_arity_get"}, {}, {}, {}),
+              std::vector<int>{kInvalidParams});
+
+    // --- Put: ranges/end/revoke without start ---
+    {
+        std::vector<std::string> keys = {"no_put_session"};
+        auto ranges = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+
+        auto end_rcs = py_client_->batch_put_session_end(keys);
+        ASSERT_EQ(end_rcs.size(), 1);
+        EXPECT_EQ(end_rcs[0], kInvalidParams);
+
+        auto revoke_rcs = py_client_->batch_put_session_revoke(keys);
+        ASSERT_EQ(revoke_rcs.size(), 1);
+        EXPECT_EQ(revoke_rcs[0], kInvalidParams);
+    }
+
+    // --- Put: keys/sizes mismatch ---
+    {
+        auto rcs =
+            py_client_->batch_put_session_start({"a", "b"}, {kObjectSize});
+        ASSERT_EQ(rcs.size(), 2);
+        EXPECT_EQ(rcs[0], kInvalidParams);
+        EXPECT_EQ(rcs[1], kInvalidParams);
+    }
+
+    // --- Put: duplicate start ---
+    {
+        std::vector<std::string> keys = {"dup_put"};
+        auto first = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(first.size(), 1);
+        EXPECT_EQ(first[0], 0);
+        auto second = py_client_->batch_put_session_start(keys, {kObjectSize});
+        ASSERT_EQ(second.size(), 1);
+        EXPECT_EQ(second[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: range overflow past object_size ---
+    {
+        std::vector<std::string> keys = {"overflow_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto overflow = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}},
+            {{kObjectSize}});  // offset == size
+        ASSERT_EQ(overflow.size(), 1);
+        EXPECT_EQ(overflow[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: buffer/size/offset arity mismatch ---
+    {
+        std::vector<std::string> keys = {"arity_put"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        auto bad = py_client_->batch_put_from_multi_buffer_ranges(
+            keys, {{buf.data(), buf.data() + kPage}}, {{kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], 0);
+    }
+
+    // --- Put: end clears session; second end fails ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_put_session_start(keys, {kObjectSize})[0],
+                  0);
+        ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kObjectSize}}, {{0}})[0],
+                  static_cast<int>(kObjectSize));
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+        EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], kInvalidParams);
+        // ranges after end also fail
+        EXPECT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                      keys, {{buf.data()}}, {{kPage}}, {{0}})[0],
+                  kInvalidParams);
+    }
+
+    // --- Get: ranges without start ---
+    {
+        std::vector<std::string> keys = {"no_get_session"};
+        auto ranges = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(ranges.size(), 1);
+        EXPECT_EQ(ranges[0], kInvalidParams);
+    }
+
+    // --- Get: start on missing object ---
+    {
+        auto rcs = py_client_->batch_get_session_start({"missing_obj"});
+        ASSERT_EQ(rcs.size(), 1);
+        EXPECT_LT(rcs[0], 0);
+    }
+
+    // --- Get: end clears session; ranges after end fail ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};  // exists from above
+        auto start = py_client_->batch_get_session_start(keys);
+        ASSERT_EQ(start.size(), 1);
+        EXPECT_EQ(start[0], 0);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+        auto after_end = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage}}, {{0}});
+        ASSERT_EQ(after_end.size(), 1);
+        EXPECT_EQ(after_end[0], kInvalidParams);
+    }
+
+    // --- Get: arity mismatch while session exists ---
+    {
+        std::vector<std::string> keys = {"put_end_once"};
+        ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+        auto bad = py_client_->batch_get_into_multi_buffer_ranges(
+            keys, {{buf.data()}}, {{kPage, kPage}}, {{0}});
+        ASSERT_EQ(bad.size(), 1);
+        EXPECT_EQ(bad[0], kInvalidParams);
+        EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    }
+
+    ASSERT_EQ(py_client_->unregister_buffer(buf.data()), 0);
+}
+
+// Put session must survive BatchPutEnd failure so caller can retry end/revoke.
+TEST_F(RealClientTest, TestPutSessionKeptAfterEndFailure) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17817", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kObjectNotFound =
+        static_cast<int>(toInt(ErrorCode::OBJECT_NOT_FOUND));
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::vector<std::string> keys = {"session_end_fail_keep"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+
+    // Drop Master reservation while keeping the local put session.
+    ASSERT_NE(py_client_->client_, nullptr);
+    auto revoked = py_client_->client_->BatchPutRevoke(keys, ReplicaType::ALL);
+    ASSERT_EQ(revoked.size(), 1u);
+    ASSERT_TRUE(revoked[0].has_value());
+
+    auto end1 = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(end1.size(), 1u);
+    EXPECT_EQ(end1[0], kObjectNotFound)
+        << "end should surface Master OBJECT_NOT_FOUND";
+
+    // Session must still exist: second end is not INVALID_PARAMS.
+    auto end2 = py_client_->batch_put_session_end(keys);
+    ASSERT_EQ(end2.size(), 1u);
+    EXPECT_EQ(end2[0], kObjectNotFound)
+        << "put session should be kept after end failure";
+
+    // Revoke clears the local session even when Master object is already gone.
+    auto revoke_rcs = py_client_->batch_put_session_revoke(keys);
+    ASSERT_EQ(revoke_rcs.size(), 1u);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    EXPECT_EQ(py_client_->batch_put_session_end(keys)[0], kInvalidParams);
+    EXPECT_EQ(py_client_->batch_put_session_revoke(keys)[0], kInvalidParams);
+}
+
+// Reliable NoF configs cannot be finalized by the session put path.
+TEST_F(RealClientTest, TestPutSessionStartRejectsReliableNofConfig) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17819", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.nof_replica_num = 2;  // RELIABLE_MULTI_REPLICA
+
+    auto rcs =
+        py_client_->batch_put_session_start({"reliable_nof"}, {128}, config);
+    ASSERT_EQ(rcs.size(), 1u);
+    EXPECT_EQ(rcs[0], kInvalidParams);
+}
+
+// Filtered start_keys must keep group_ids aligned (skip existing sessions).
+TEST_F(RealClientTest, TestPutSessionStartFiltersGroupIds) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17820", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    ReplicateConfig first_config;
+    first_config.group_ids = std::vector<std::string>{"group_a"};
+    ASSERT_EQ(py_client_->batch_put_session_start({"group_key_a"}, {kSize},
+                                                  first_config)[0],
+              0);
+
+    ReplicateConfig batch_config;
+    batch_config.group_ids = std::vector<std::string>{"group_a", "group_b"};
+    auto rcs = py_client_->batch_put_session_start(
+        {"group_key_a", "group_key_b"}, {kSize, kSize}, batch_config);
+    ASSERT_EQ(rcs.size(), 2u);
+    EXPECT_EQ(rcs[0], kInvalidParams) << "existing session should be skipped";
+    EXPECT_EQ(rcs[1], 0) << "filtered group_ids must match remaining keys";
+
+    auto revoke_rcs =
+        py_client_->batch_put_session_revoke({"group_key_a", "group_key_b"});
+    ASSERT_EQ(revoke_rcs.size(), 2u);
+    EXPECT_EQ(revoke_rcs[0], 0);
+    EXPECT_EQ(revoke_rcs[1], 0);
+}
+
+// Session put finalizes MEMORY only; complete object must be readable.
+TEST_F(RealClientTest, TestPutSessionEndCompletesMemoryReplica) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17818", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 256;
+    std::string src(kSize, 'P');
+    std::string dst(kSize, 'Q');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    std::vector<std::string> keys = {"session_memory_end"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+
+    auto descs = py_client_->get_replica_desc(keys[0]);
+    ASSERT_EQ(descs.size(), 1u);
+    EXPECT_TRUE(descs[0].is_memory_replica());
+    EXPECT_EQ(descs[0].status, ReplicaStatus::COMPLETE);
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+    ASSERT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  keys, {{dst.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(dst, src);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+// Lease expire on get ranges must drop the cached get session.
+TEST_F(RealClientTest, TestGetSessionLeaseExpiredDropsSession) {
+    constexpr uint64_t kLeaseTtlMs = 50;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17816", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    constexpr size_t kSize = 128;
+    const int kLeaseExpired = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
+    const int kInvalidParams =
+        static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+
+    std::string src(kSize, 'S');
+    std::string dst(kSize, 'D');
+    ASSERT_EQ(py_client_->register_buffer(src.data(), src.size()), 0);
+    ASSERT_EQ(py_client_->register_buffer(dst.data(), dst.size()), 0);
+
+    std::vector<std::string> keys = {"lease_session_key"};
+    ASSERT_EQ(py_client_->batch_put_session_start(keys, {kSize})[0], 0);
+    ASSERT_EQ(py_client_->batch_put_from_multi_buffer_ranges(
+                  keys, {{src.data()}}, {{kSize}}, {{0}})[0],
+              static_cast<int>(kSize));
+    ASSERT_EQ(py_client_->batch_put_session_end(keys)[0], 0);
+
+    ASSERT_EQ(py_client_->batch_get_session_start(keys)[0], 0);
+
+    // Wait past cached lease_deadline (client-local check; no Master query).
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs + 50));
+
+    auto expired = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(expired.size(), 1);
+    EXPECT_EQ(expired[0], kLeaseExpired)
+        << "get ranges after lease ttl should return LEASE_EXPIRED";
+
+    // Session must have been erased: next ranges sees no session.
+    auto again = py_client_->batch_get_into_multi_buffer_ranges(
+        keys, {{dst.data()}}, {{kSize}}, {{0}});
+    ASSERT_EQ(again.size(), 1);
+    EXPECT_EQ(again[0], kInvalidParams)
+        << "get session should be dropped after LEASE_EXPIRED";
+
+    // get_end is still safe (idempotent erase).
+    EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+
+    ASSERT_EQ(py_client_->unregister_buffer(src.data()), 0);
+    ASSERT_EQ(py_client_->unregister_buffer(dst.data()), 0);
+}
+
+TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string test_data =
+        "It's a test data for get_allocated_buffer_desc.";
+    const std::string key = "mooncake_key";
+    // put test_data with replica_config
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    py_client_->put(key, data_span, config);
+    // test get_replica_desc
+    std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
+    EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc[0].is_memory_replica(), true)
+        << "get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc
+    std::vector<std::string> keys = {key};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map =
+        py_client_->batch_get_replica_desc(keys);
+    EXPECT_EQ(desc_map[key].size(), 1)
+        << "batch_get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc_map[key][0].is_memory_replica(), true)
+        << "batch_get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc with error keys
+    std::vector<std::string> keys1 = {"test_key_1"};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map1 =
+        py_client_->batch_get_replica_desc(keys1);
+    EXPECT_EQ(desc_map1.size(), 0)
+        << "batch_get_replica_desc should return empty map when all "
+           "keys is invalid";
+}
+
+TEST_F(RealClientTest, TestCopyMoveQueryTask) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+
+    // Setup client 1
+    const std::string client1_addr = "localhost:17813";
+    ASSERT_EQ(
+        py_client_->setup_real(client1_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
+        0);
+
+    // Setup client 2
+    auto py_client2 = RealClient::create();
+    const std::string client2_addr = "localhost:17814";
+    ASSERT_EQ(
+        py_client2->setup_real(client2_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
+        0);
+
+    const std::string test_data = "Hello, CopyMoveQueryTask!";
+    const std::string key = "test_key_copymove";
+
+    // Put data on client 1
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = client1_addr;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    auto wait_for_task = [this](const UUID& task_id) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            auto query_res = py_client_->query_task(task_id);
+            if (query_res.has_value() &&
+                is_finished_status(query_res->status)) {
+                return query_res;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return py_client_->query_task(task_id);
+    };
+
+    // Test create copy task from client 1 to client 2
+    auto copy_res = py_client_->create_copy_task(key, {client2_addr});
+    ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
+    UUID copy_task_id = copy_res.value();
+
+    auto query_copy_res = wait_for_task(copy_task_id);
+    ASSERT_TRUE(query_copy_res.has_value()) << "QueryTask should succeed";
+    EXPECT_EQ(query_copy_res->id, copy_task_id);
+    EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
+    EXPECT_EQ(query_copy_res->status, TaskStatus::SUCCESS)
+        << query_copy_res->message;
+
+    // Test create move task from client 1 to client 2
+    auto move_res =
+        py_client_->create_move_task(key, client1_addr, client2_addr);
+    ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
+    UUID move_task_id = move_res.value();
+
+    auto query_move_res = wait_for_task(move_task_id);
+    ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
+    EXPECT_EQ(query_move_res->id, move_task_id);
+    EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
+    EXPECT_EQ(query_move_res->status, TaskStatus::SUCCESS)
+        << query_move_res->message;
+
+    py_client2->tearDownAll();
+}
+
+TEST_F(RealClientTest, SetupWithConfigDict) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    ConfigDict config;
+    auto result = py_client_->setup_internal(config);
+    ASSERT_FALSE(result.has_value()) << "Setup with empty config should fail";
+
+    config = MakeConfigDict("localhost:17813", std::to_string(16 * 1024 * 1024),
+                            std::to_string(16 * 1024 * 1024));
+
+    result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value()) << "Setup with ConfigDict should succeed";
+
+    const std::string test_data = "Hello, ConfigDict!";
+    const std::string key = "test_key_configdict";
+
+    // Test Put operation
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig rep_config;
+    rep_config.replica_num = 1;
+
+    int put_result = py_client_->put(key, data_span, rep_config);
+    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+
+    // Test Get operation
+    auto buffer_handle = py_client_->get_buffer(key);
+    ASSERT_TRUE(buffer_handle != nullptr) << "Get buffer should succeed";
+
+    std::string retrieved_data(static_cast<const char*>(buffer_handle->ptr()),
+                               buffer_handle->size());
+    EXPECT_EQ(retrieved_data, test_data) << "Retrieved data should match";
+}
+
+TEST_F(RealClientTest, SetupWithConfigDictHumanReadableSizes) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict("localhost:17814", "16MB", "16 MB");
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "Setup should accept human-readable size strings";
+}
+
+TEST_F(RealClientTest, SetupWithConfigDictAllowsZeroSizes) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config = MakeConfigDict("localhost:17815", "0", "0");
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "Setup should preserve zero-size pure client/server semantics";
+}
+
+TEST_F(RealClientTest,
+       ConfigDictGlobalSegmentSizeAboveMaxPassesSizeValidation) {
+    ConfigDict config = MakeConfigDict(
+        "localhost:17816", std::to_string(MAX_SEGMENT_SIZE + 1), "0");
+    config[CONFIG_KEY_PROTOCOL] = "tcp";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = "127.0.0.1:1";
+
+    ::testing::internal::CaptureStderr();
+    auto result = py_client_->setup_internal(config);
+    const std::string logs = ::testing::internal::GetCapturedStderr();
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(logs.find("Invalid global_segment_size"), std::string::npos)
+        << "global_segment_size above MAX_SEGMENT_SIZE should be accepted as "
+           "total capacity by ConfigDict validation";
+}
+
+TEST_F(RealClientTest, ErrSetupWithInvalidConfigDictSize) {
+    GLogMuter muter;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    struct InvalidSizeCase {
+        std::string local_hostname;
+        std::string global_segment_size;
+        std::string local_buffer_size;
+    };
+
+    const InvalidSizeCase invalid_size_cases[] = {
+        {"localhost:17816", "50%", "16MB"},
+        {"localhost:17817", "16MB", "16XB"},
+        {"localhost:17818", "-5", "16MB"},
+        {"localhost:17819", "0", std::to_string(MAX_SEGMENT_SIZE + 1)},
+    };
+
+    for (const auto& test_case : invalid_size_cases) {
+        ConfigDict config = MakeConfigDict(test_case.local_hostname,
+                                           test_case.global_segment_size,
+                                           test_case.local_buffer_size);
+        auto result = py_client_->setup_internal(config);
+        EXPECT_FALSE(result.has_value())
+            << "Invalid explicit size values should fail instead of being "
+               "partially parsed or silently defaulted";
+    }
+}
+
+TEST_F(RealClientTest, ErrSetupWithInvalidArgument) {
+    GLogMuter muter;
+    // Case 1: Setup with unreachable master address
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    int result = py_client_->setup_real(
+        "localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024, 16 * 1024 * 1024,
+        FLAGS_protocol, rdma_devices, "192.0.2.1:1");
+    EXPECT_NE(result, 0) << "Setup with unreachable master should fail";
+
+    // Case 2: Setup with invalid protocol
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                    16 * 1024 * 1024, 16 * 1024 * 1024,
+                                    "invalid_protocol", "", master_address_);
+    EXPECT_NE(result, 0) << "Setup with invalid protocol should fail";
+
+    // Case 3: Setup with empty hostname
+    result = py_client_->setup_real("", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                                    16 * 1024 * 1024, FLAGS_protocol,
+                                    rdma_devices, master_address_);
+    EXPECT_NE(result, 0) << "Setup with empty hostname should fail";
+}
+
+// Operations on uninitialized client (before setup_real)
+TEST_F(RealClientTest, ErrOperationsBeforeSetup) {
+    const std::string key = "before_setup_key";
+    const std::string data = "test_data";
+    std::span<const char> data_span(data.data(), data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    GLogMuter muter;
+    EXPECT_NE(py_client_->put(key, data_span, config), 0)
+        << "Put before setup should fail";
+
+    EXPECT_EQ(py_client_->get_buffer(key), nullptr)
+        << "get_buffer before setup should return nullptr";
+
+    EXPECT_LT(py_client_->isExist(key), 0)
+        << "isExist before setup should return negative";
+
+    EXPECT_NE(py_client_->remove(key), 0) << "remove before setup should fail";
+
+    EXPECT_LT(py_client_->getSize(key), 0)
+        << "getSize before setup should return negative";
+
+    EXPECT_NE(py_client_->removeAll(), 0)
+        << "removeAll before setup should fail";
+    // tearDownAll should be idempotent even before setup
+    EXPECT_EQ(py_client_->tearDownAll(), 0)
+        << "tearDownAll before setup should succeed (no-op)";
+}
+
+// Get / query non-existent keys after proper setup
+TEST_F(RealClientTest, ErrGetNonExistentKey) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    GLogMuter muter;
+
+    // isExist should return 0 (not found)
+    EXPECT_EQ(py_client_->isExist("nonexistent_key"), 0)
+        << "isExist for missing key should return 0";
+
+    EXPECT_EQ(py_client_->get_buffer("nonexistent_key"), nullptr)
+        << "get_buffer for missing key should return nullptr";
+
+    EXPECT_LT(py_client_->getSize("nonexistent_key"), 0)
+        << "getSize for missing key should return negative";
+
+    // get_into should return error
+    char buf[64];
+    int reg = py_client_->register_buffer(buf, sizeof(buf));
+    EXPECT_EQ(reg, 0) << "Buffer registration should succeed";
+    EXPECT_LT(py_client_->get_into("nonexistent_key", buf, sizeof(buf)), 0)
+        << "get_into for missing key should return negative";
+    EXPECT_EQ(py_client_->unregister_buffer(buf), 0);
+
+    // batch_get_buffer should return vector of nullptrs
+    auto handles =
+        py_client_->batch_get_buffer({"no_key_1", "no_key_2", "no_key_3"});
+    ASSERT_EQ(handles.size(), 3u);
+    for (size_t i = 0; i < handles.size(); ++i) {
+        EXPECT_EQ(handles[i], nullptr)
+            << "batch_get_buffer[" << i << "] should be nullptr";
+    }
+}
+
+// Get after remove
+TEST_F(RealClientTest, ErrGetAfterRemove) {
+    const uint64_t kv_lease_ttl_ = 1;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kv_lease_ttl_)
+                                  .build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "remove_then_get_key";
+    const std::string data = "some_data_to_remove";
+    std::span<const char> data_span(data.data(), data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Put and verify existence
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+    EXPECT_EQ(py_client_->isExist(key), 1) << "Key should exist after put";
+
+    // Remove
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl_));
+    EXPECT_EQ(py_client_->remove(key), 0) << "Remove should succeed";
+
+    // Verify key is gone
+    EXPECT_EQ(py_client_->isExist(key), 0)
+        << "Key should not exist after remove";
+    GLogMuter muter;
+    EXPECT_EQ(py_client_->get_buffer(key), nullptr)
+        << "get_buffer should return nullptr after remove";
+
+    // Second remove should not crash (may return 0 or error)
+    py_client_->remove(key);
+}
+
+// Duplicate put with same key
+TEST_F(RealClientTest, ErrDuplicatePutSameKey) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string key = "duplicate_put_key";
+    const std::string data1 = "first_value";
+    const std::string data2 = "second_value_longer";
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // First put
+    std::span<const char> span1(data1.data(), data1.size());
+    ASSERT_EQ(py_client_->put(key, span1, config), 0)
+        << "First put should succeed";
+    EXPECT_EQ(py_client_->isExist(key), 1);
+
+    // Second put with different data on the same key
+    std::span<const char> span2(data2.data(), data2.size());
+    EXPECT_EQ(0, py_client_->put(key, span2, config));
+
+    // If the second put succeeds, verify we get the original data
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr) << "get_buffer should succeed";
+    EXPECT_EQ(buf->size(), data1.size())
+        << "Buffer size should match original data from the first put";
+    std::string retrieved(static_cast<const char*>(buf->ptr()), buf->size());
+    EXPECT_EQ(retrieved, data1)
+        << "Retrieved data should match original data from the first put";
+}
+
+// Buffer registration edge cases
+TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    // Unregister a buffer that was never registered
+    {
+        char unregistered_buf[64];
+        GLogMuter muter;
+        int result = py_client_->unregister_buffer(unregistered_buf);
+        EXPECT_NE(result, 0) << "Unregistering unknown buffer should fail";
+    }
+
+    // Normal register then duplicate register
+    {
+        char buf[1024];
+        EXPECT_EQ(py_client_->register_buffer(buf, sizeof(buf)), 0)
+            << "First registration should succeed";
+
+        // Second registration of the same memory
+        {
+            GLogMuter muter;
+            EXPECT_NE(py_client_->register_buffer(buf, sizeof(buf)), 0)
+                << "Duplicate registration of the same buffer should fail.";
+        }
+
+        // Cleanup
+        EXPECT_EQ(py_client_->unregister_buffer(buf), 0)
+            << "Unregistration should succeed";
+    }
+}
+
+// ===================== Upsert Interface Tests =====================
+
+// Test upsert(key, span) — copy semantics, single key
+TEST_F(RealClientTest, UpsertBasic) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Case A: upsert a new key
+    const std::string data_v1 = "upsert_basic_v1!";
+    const std::string key = "upsert_basic_key";
+    std::span<const char> span_v1(data_v1.data(), data_v1.size());
+    EXPECT_EQ(py_client_->upsert(key, span_v1, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v1);
+
+    // Case B: upsert same size — in-place update
+    const std::string data_v2 = "upsert_basic_v2!";
+    std::span<const char> span_v2(data_v2.data(), data_v2.size());
+    EXPECT_EQ(py_client_->upsert(key, span_v2, config), 0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v2);
+}
+
+// Test upsert_from(key, buffer, size) — zero-copy, single key
+TEST_F(RealClientTest, UpsertFrom) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "upsert_from_key";
+
+    // Put initial data
+    std::string data_v1(64, 'A');
+    EXPECT_EQ(py_client_->register_buffer(data_v1.data(), data_v1.size()), 0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v1.data(), data_v1.size(), config),
+        0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v1);
+
+    // Upsert same size with different content
+    std::string data_v2(64, 'B');
+    EXPECT_EQ(py_client_->register_buffer(data_v2.data(), data_v2.size()), 0);
+    EXPECT_EQ(
+        py_client_->upsert_from(key, data_v2.data(), data_v2.size(), config),
+        0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              data_v2);
+
+    py_client_->unregister_buffer(data_v1.data());
+    py_client_->unregister_buffer(data_v2.data());
+}
+
+// Test upsert_parts(key, spans) — multi-part copy, single key
+TEST_F(RealClientTest, UpsertParts) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "upsert_parts_key";
+
+    // Upsert from multiple parts
+    const std::string part1 = "Hello, ";
+    const std::string part2 = "World!";
+    const std::string expected = part1 + part2;
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part1.data(), part1.size());
+    parts.emplace_back(part2.data(), part2.size());
+
+    EXPECT_EQ(py_client_->upsert_parts(key, parts, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(buf->size(), expected.size());
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected);
+
+    // Upsert again with different parts, same total size
+    const std::string part3 = "Goodbye";
+    const std::string part4 = "Moon!!";
+    const std::string expected2 = part3 + part4;
+    ASSERT_EQ(expected2.size(), expected.size());
+    std::vector<std::span<const char>> parts2;
+    parts2.emplace_back(part3.data(), part3.size());
+    parts2.emplace_back(part4.data(), part4.size());
+
+    EXPECT_EQ(py_client_->upsert_parts(key, parts2, config), 0);
+
+    buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected2);
+}
+
+// Test batch_upsert_from(keys, buffers, sizes) — zero-copy, batch
+TEST_F(RealClientTest, BatchUpsertFrom) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Prepare 3 keys with registered buffers
+    std::string data0(32, 'X');
+    std::string data1(32, 'Y');
+    std::string data2(32, 'Z');
+    EXPECT_EQ(py_client_->register_buffer(data0.data(), data0.size()), 0);
+    EXPECT_EQ(py_client_->register_buffer(data1.data(), data1.size()), 0);
+    EXPECT_EQ(py_client_->register_buffer(data2.data(), data2.size()), 0);
+
+    std::vector<std::string> keys = {"batch_upsert_0", "batch_upsert_1",
+                                     "batch_upsert_2"};
+    std::vector<void*> buffers = {data0.data(), data1.data(), data2.data()};
+    std::vector<size_t> sizes = {data0.size(), data1.size(), data2.size()};
+
+    auto results = py_client_->batch_upsert_from(keys, buffers, sizes, config);
+    ASSERT_EQ(results.size(), 3);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], 0)
+            << "batch_upsert_from failed for key " << keys[i];
+    }
+
+    // Verify each key
+    std::vector<std::string*> expected = {&data0, &data1, &data2};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto buf = py_client_->get_buffer(keys[i]);
+        ASSERT_NE(buf, nullptr) << "get_buffer failed for " << keys[i];
+        EXPECT_EQ(
+            std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+            *expected[i]);
+    }
+
+    py_client_->unregister_buffer(data0.data());
+    py_client_->unregister_buffer(data1.data());
+    py_client_->unregister_buffer(data2.data());
+}
+
+// Test upsert_batch(keys, spans) — copy semantics, batch
+TEST_F(RealClientTest, UpsertBatch) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> keys = {"upsert_batch_0", "upsert_batch_1",
+                                     "upsert_batch_2"};
+    std::string val0 = "value_for_key_0!";
+    std::string val1 = "value_for_key_1!";
+    std::string val2 = "value_for_key_2!";
+    std::vector<std::span<const char>> values;
+    values.emplace_back(val0.data(), val0.size());
+    values.emplace_back(val1.data(), val1.size());
+    values.emplace_back(val2.data(), val2.size());
+
+    EXPECT_EQ(py_client_->upsert_batch(keys, values, config), 0);
+
+    // Verify each key
+    std::vector<std::string*> expected = {&val0, &val1, &val2};
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto buf = py_client_->get_buffer(keys[i]);
+        ASSERT_NE(buf, nullptr) << "get_buffer failed for " << keys[i];
+        EXPECT_EQ(
+            std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+            *expected[i]);
+    }
+}
+
+// ===================== Batch Existence Tests =====================
+
+TEST_F(RealClientTest, BatchIsExistMixed) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string data = "batch_exist_data";
+    std::span<const char> data_span(data.data(), data.size());
+    ASSERT_EQ(py_client_->put("exist_key_1", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("exist_key_2", data_span, config), 0);
+
+    std::vector<std::string> keys = {"exist_key_1", "missing_key",
+                                     "exist_key_2", "also_missing"};
+    auto results = py_client_->batchIsExist(keys);
+    ASSERT_EQ(results.size(), 4u);
+    EXPECT_EQ(results[0], 1) << "exist_key_1 should exist";
+    EXPECT_EQ(results[1], 0) << "missing_key should not exist";
+    EXPECT_EQ(results[2], 1) << "exist_key_2 should exist";
+    EXPECT_EQ(results[3], 0) << "also_missing should not exist";
+}
+
+TEST_F(RealClientTest, ErrBatchIsExistBeforeSetup) {
+    GLogMuter muter;
+    std::vector<std::string> keys = {"k1", "k2"};
+    auto results = py_client_->batchIsExist(keys);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_LT(results[i], 0)
+            << "batchIsExist[" << i << "] before setup should return negative";
+    }
+}
+
+// ===================== GetSize Tests =====================
+
+TEST_F(RealClientTest, GetSizeBasic) {
+    StartMasterAndSetupClient();
+
+    const std::string data = "getsize_payload_123";
+    const std::string key = "getsize_key";
+    std::span<const char> data_span(data.data(), data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+    int64_t size = py_client_->getSize(key);
+    EXPECT_EQ(size, static_cast<int64_t>(data.size()))
+        << "getSize should return exact data length";
+}
+
+TEST_F(RealClientTest, ErrGetSizeBeforeSetup) {
+    GLogMuter muter;
+    EXPECT_LT(py_client_->getSize("any_key"), 0)
+        << "getSize before setup should return negative";
+}
+
+// ===================== RemoveByRegex Tests =====================
+
+TEST_F(RealClientTest, RemoveByRegexBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "regex_data";
+    std::span<const char> data_span(data.data(), data.size());
+
+    ASSERT_EQ(py_client_->put("prefix_alpha", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("prefix_beta", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("other_key", data_span, config), 0);
+
+    long removed = py_client_->removeByRegex("^prefix_.*");
+    EXPECT_EQ(removed, 2) << "Should remove exactly the two prefix_ keys";
+
+    EXPECT_EQ(py_client_->isExist("prefix_alpha"), 0);
+    EXPECT_EQ(py_client_->isExist("prefix_beta"), 0);
+    EXPECT_EQ(py_client_->isExist("other_key"), 1)
+        << "Non-matching key should survive";
+}
+
+TEST_F(RealClientTest, RemoveByRegexNoMatch) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "no_match_data";
+    std::span<const char> data_span(data.data(), data.size());
+    ASSERT_EQ(py_client_->put("some_key", data_span, config), 0);
+
+    long removed = py_client_->removeByRegex("^nonexistent_pattern_.*");
+    EXPECT_EQ(removed, 0) << "No keys should match";
+    EXPECT_EQ(py_client_->isExist("some_key"), 1)
+        << "Existing key should remain";
+}
+
+TEST_F(RealClientTest, ErrRemoveByRegexBeforeSetup) {
+    GLogMuter muter;
+    long result = py_client_->removeByRegex(".*");
+    EXPECT_LT(result, 0) << "removeByRegex before setup should return negative";
+}
+
+// ===================== RemoveAll Edge Cases =====================
+
+TEST_F(RealClientTest, RemoveAllOnEmptyStore) {
+    StartMasterAndSetupClient();
+    long removed = py_client_->removeAll();
+    EXPECT_EQ(removed, 0) << "removeAll on empty store should return 0";
+}
+
+// ===================== BatchRemove Tests =====================
+
+TEST_F(RealClientTest, BatchRemoveBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string data = "batch_rm_data";
+    std::span<const char> data_span(data.data(), data.size());
+
+    ASSERT_EQ(py_client_->put("brm_1", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("brm_2", data_span, config), 0);
+    ASSERT_EQ(py_client_->put("brm_3", data_span, config), 0);
+
+    std::vector<std::string> keys_to_remove = {"brm_1", "brm_3"};
+    auto results = py_client_->batchRemove(keys_to_remove);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_EQ(results[i], 0) << "batchRemove[" << i << "] should succeed";
+    }
+
+    EXPECT_EQ(py_client_->isExist("brm_1"), 0);
+    EXPECT_EQ(py_client_->isExist("brm_2"), 1) << "brm_2 should survive";
+    EXPECT_EQ(py_client_->isExist("brm_3"), 0);
+}
+
+TEST_F(RealClientTest, BatchRemoveNonExistentKeys) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> keys = {"never_existed_1", "never_existed_2"};
+    auto results = py_client_->batchRemove(keys);
+    ASSERT_EQ(results.size(), 2u);
+}
+
+TEST_F(RealClientTest, ErrBatchRemoveBeforeSetup) {
+    GLogMuter muter;
+    std::vector<std::string> keys = {"k1", "k2"};
+    auto results = py_client_->batchRemove(keys);
+    ASSERT_EQ(results.size(), 2u);
+    for (size_t i = 0; i < results.size(); ++i) {
+        EXPECT_NE(results[i], 0)
+            << "batchRemove[" << i << "] before setup should fail";
+    }
+}
+
+// ===================== PutParts Tests =====================
+
+TEST_F(RealClientTest, PutPartsBasic) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "put_parts_key";
+
+    const std::string part1 = "Hello, ";
+    const std::string part2 = "Parts!";
+    const std::string expected = part1 + part2;
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part1.data(), part1.size());
+    parts.emplace_back(part2.data(), part2.size());
+
+    EXPECT_EQ(py_client_->put_parts(key, parts, config), 0);
+
+    auto buf = py_client_->get_buffer(key);
+    ASSERT_NE(buf, nullptr);
+    EXPECT_EQ(buf->size(), expected.size());
+    EXPECT_EQ(std::string(static_cast<const char*>(buf->ptr()), buf->size()),
+              expected);
+}
+
+TEST_F(RealClientTest, ErrPutPartsBeforeSetup) {
+    GLogMuter muter;
+    const std::string part = "data";
+    std::vector<std::span<const char>> parts;
+    parts.emplace_back(part.data(), part.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    EXPECT_NE(py_client_->put_parts("key", parts, config), 0)
+        << "put_parts before setup should fail";
+}
+
+// ===================== PutBatch and GetBatch Tests =====================
+
+TEST_F(RealClientTest, PutBatchThenBatchGetBuffer) {
+    StartMasterAndSetupClient();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::vector<std::string> keys = {"batch_kv_0", "batch_kv_1", "batch_kv_2"};
+    std::string val0 = "value_zero";
+    std::string val1 = "value_one!";
+    std::string val2 = "value_two!";
+    std::vector<std::span<const char>> values;
+    values.emplace_back(val0.data(), val0.size());
+    values.emplace_back(val1.data(), val1.size());
+    values.emplace_back(val2.data(), val2.size());
+
+    ASSERT_EQ(py_client_->put_batch(keys, values, config), 0);
+
+    auto handles = py_client_->batch_get_buffer(keys);
+    ASSERT_EQ(handles.size(), 3u);
+
+    std::vector<std::string*> expected = {&val0, &val1, &val2};
+    for (size_t i = 0; i < handles.size(); ++i) {
+        ASSERT_NE(handles[i], nullptr)
+            << "Handle " << i << " should not be null";
+        EXPECT_EQ(std::string(static_cast<const char*>(handles[i]->ptr()),
+                              handles[i]->size()),
+                  *expected[i])
+            << "Data mismatch for key " << keys[i];
+    }
+}
+
+// ===================== HealthCheck Tests =====================
+
+TEST_F(RealClientTest, HealthCheckAfterSetup) {
+    StartMasterAndSetupClient();
+    EXPECT_EQ(py_client_->health_check(), HC_HEALTHY)
+        << "health_check should return HEALTHY after setup";
+}
+
+TEST_F(RealClientTest, HealthCheckBeforeSetup) {
+    int result = py_client_->health_check();
+    EXPECT_EQ(result, HC_NOT_INITIALIZED)
+        << "health_check before setup should return NOT_INITIALIZED";
+}
+
+// ===================== GetHostname Tests =====================
+
+TEST_F(RealClientTest, GetHostnameAfterSetup) {
+    StartMasterAndSetupClient();
+    std::string hostname = py_client_->get_hostname();
+    EXPECT_FALSE(hostname.empty()) << "get_hostname should return non-empty";
+    EXPECT_EQ(hostname, "localhost:17813")
+        << "get_hostname should match the configured hostname";
+}
+
+// ===================== Double TearDown Tests =====================
+
+TEST_F(RealClientTest, DoubleTearDownIsIdempotent) {
+    StartMasterAndSetupClient();
+
+    EXPECT_EQ(py_client_->tearDownAll(), 0) << "First teardown should succeed";
+    EXPECT_EQ(py_client_->tearDownAll(), 0)
+        << "Second teardown should also succeed (idempotent)";
+}
+
+// ===================== Empty Batch Operations =====================
+
+TEST_F(RealClientTest, EmptyBatchOperations) {
+    StartMasterAndSetupClient();
+
+    std::vector<std::string> empty_keys;
+    std::vector<std::span<const char>> empty_values;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    EXPECT_EQ(py_client_->put_batch(empty_keys, empty_values, config), 0)
+        << "put_batch with empty input should succeed";
+
+    auto handles = py_client_->batch_get_buffer(empty_keys);
+    EXPECT_TRUE(handles.empty())
+        << "batch_get_buffer with empty input should return empty";
+
+    auto exist_results = py_client_->batchIsExist(empty_keys);
+    EXPECT_TRUE(exist_results.empty())
+        << "batchIsExist with empty input should return empty";
+
+    auto remove_results = py_client_->batchRemove(empty_keys);
+    EXPECT_TRUE(remove_results.empty())
+        << "batchRemove with empty input should return empty";
+}
+
+// ===================== Mount Segment Edge Cases =====================
+
+TEST_F(RealClientTest, ErrMountNonExistentFile) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> segment_ids;
+    int ret =
+        py_client_->mountSegment("/tmp/mooncake_nonexistent_file_12345", 0,
+                                 4096, FLAGS_protocol, "", segment_ids);
+    EXPECT_NE(ret, 0) << "Mounting non-existent file should fail";
+    EXPECT_TRUE(segment_ids.empty());
+}
+
+TEST_F(RealClientTest, ErrUnmountInvalidSegmentIds) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> bogus_ids = {
+        "00000000-0000-0000-0000-000000000000"};
+    int ret = py_client_->unmountSegment(bogus_ids);
+    EXPECT_NE(ret, 0) << "Unmounting non-existent segment ids should fail";
+}
+
+TEST_F(RealClientTest, ErrUnmountAndFreeInvalidSegmentIds) {
+    StartMasterAndSetupClient();
+
+    GLogMuter muter;
+    std::vector<std::string> bogus_ids = {
+        "00000000-0000-0000-0000-000000000000"};
+    int ret = py_client_->unmountAndFreeSegment(bogus_ids);
+    EXPECT_NE(ret, 0)
+        << "Unmount-and-free of non-existent segment ids should fail";
+}
+
+#if defined(USE_SUNRISE)
+TEST_F(RealClientTest, SetupWithConfigDictAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    ConfigDict config;
+    config[CONFIG_KEY_LOCAL_HOSTNAME] = "localhost:17813";
+    config[CONFIG_KEY_METADATA_SERVER] = "P2PHANDSHAKE";
+    config[CONFIG_KEY_GLOBAL_SEGMENT_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_LOCAL_BUFFER_SIZE] = std::to_string(16 * 1024 * 1024);
+    config[CONFIG_KEY_PROTOCOL] = "sunrise_link";
+    config[CONFIG_KEY_MASTER_SERVER_ADDR] = master_address_;
+
+    auto result = py_client_->setup_internal(config);
+    ASSERT_TRUE(result.has_value())
+        << "setup_internal(ConfigDict) should accept sunrise_link protocol";
+}
+
+TEST_F(RealClientTest, SetupAcceptsSunriseLink) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    int result = py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                        16 * 1024 * 1024, 16 * 1024 * 1024,
+                                        "sunrise_link", "", master_address_);
+    EXPECT_EQ(result, 0) << "sunrise_link should work with Classic TE";
+}
+
+TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     "sunrise_link", "", master_address_),
+              0);
+
+    const std::string key = "sunrise_link_host_key";
+    const std::string value = "sunrise_link_host_value";
+    std::span<const char> data_span(value.data(), value.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    {
+        auto buffer_handle = py_client_->get_buffer(key);
+        ASSERT_NE(buffer_handle, nullptr);
+        std::string actual(static_cast<const char*>(buffer_handle->ptr()),
+                           buffer_handle->size());
+        EXPECT_EQ(actual, value);
+    }
+
+    EXPECT_EQ(py_client_->remove(key, true), 0);
+    EXPECT_EQ(py_client_->isExist(key), 0);
+}
+#endif
 
 }  // namespace testing
 

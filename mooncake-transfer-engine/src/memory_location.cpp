@@ -14,15 +14,43 @@
 
 #include "memory_location.h"
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
+#include <unistd.h>
 
-#ifdef USE_MUSA
-#include <musa_porting.h>
-#endif
+#include <cctype>
+#include <cstdio>
+#include <fstream>
+
+#include "cuda_alike.h"
 
 namespace mooncake {
+
+size_t detectBufferPageSize(void *addr) {
+    const size_t fallback = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    std::ifstream smaps("/proc/self/smaps");
+    if (!smaps.is_open()) return fallback;
+
+    const uintptr_t target = reinterpret_cast<uintptr_t>(addr);
+    std::string line;
+    bool in_range = false;
+
+    while (std::getline(smaps, line)) {
+        // VMA header: "start-end perms offset dev inode [pathname]".
+        if (!line.empty() &&
+            std::isxdigit(static_cast<unsigned char>(line[0]))) {
+            unsigned long start = 0, end = 0;
+            if (std::sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
+                in_range = target >= start && target < end;
+            }
+        } else if (in_range && line.compare(0, 15, "KernelPageSize:") == 0) {
+            unsigned long kb = 0;
+            if (std::sscanf(line.c_str(), "KernelPageSize: %lu kB", &kb) == 1 &&
+                kb > 0) {
+                return kb * 1024;
+            }
+        }
+    }
+    return fallback;
+}
 
 uintptr_t alignPage(uintptr_t address) { return address & ~(pagesize - 1); }
 
@@ -32,36 +60,54 @@ std::string genCpuNodeName(int node) {
 }
 
 std::string genGpuNodeName(int node) {
-    if (node >= 0) {
-        std::string gpuNodeName = "cuda:" + std::to_string(node);
-#ifdef USE_MUSA
-        gpuNodeName = "musa:" + std::to_string(node);
-#endif
-        return gpuNodeName;
-    }
+    if (node >= 0) return GPU_PREFIX + std::to_string(node);
     return kWildcardLocation;
 }
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_SUNRISE)
+// A GPU-less host (e.g. an RDMA-only sidecar) has no device for
+// cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
+// every buffer, each call failing and logging a per-buffer ERROR that
+// buries real logs. Detect the absence once and skip the probe.
+static bool detectCudaDevicePresent() {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                        "host memory";
+        return false;
+    }
+    return true;
+}
+#endif
 
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          size_t len,
                                                          bool only_first_page) {
     std::vector<MemoryLocationEntry> entries;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: " << result
-                   << " - " << cudaGetErrorString(result) << ")" << std::endl;
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX) || defined(USE_SUPA) || defined(USE_SUNRISE)
+    static const bool cuda_device_present = detectCudaDevicePresent();
 
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genGpuNodeName(attributes.device)});
-        return entries;
+    if (cuda_device_present) {
+        cudaPointerAttributes attributes;
+        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "cudaPointerGetAttributes failed (Error code: "
+                       << result << " - " << cudaGetErrorString(result) << ")"
+                       << std::endl;
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
+
+        if (attributes.type == cudaMemoryTypeDevice) {
+            entries.push_back(
+                {(uint64_t)start, len, genGpuNodeName(attributes.device)});
+            return entries;
+        }
     }
 #endif
 
@@ -106,6 +152,63 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     free(pages);
     free(status);
     return entries;
+}
+
+/* ------------------------------------------------------------------ */
+/* Segments location helpers                                          */
+/* ------------------------------------------------------------------ */
+
+std::string buildSegmentsLocation(size_t page_size,
+                                  const std::vector<int> &numa_nodes) {
+    std::string result =
+        kSegmentsLocationPrefix + std::to_string(page_size) + ":";
+    for (size_t i = 0; i < numa_nodes.size(); ++i) {
+        if (i > 0) result += ",";
+        result += std::to_string(numa_nodes[i]);
+    }
+    return result;
+}
+
+bool parseSegmentsLocation(const std::string &name,
+                           SegmentsLocationInfo &info) {
+    if (name.rfind(kSegmentsLocationPrefix, 0) != 0) return false;
+
+    try {
+        // "segments:<page_size>:<n0>,<n1>,..."
+        std::string body = name.substr(kSegmentsLocationPrefix.size());
+        auto colon = body.find(':');
+        if (colon == std::string::npos) return false;
+
+        info.page_size = std::stoull(body.substr(0, colon));
+        info.numa_nodes.clear();
+
+        std::string nodes_str = body.substr(colon + 1);
+        size_t pos = 0;
+        while (pos < nodes_str.size()) {
+            auto comma = nodes_str.find(',', pos);
+            std::string tok = (comma == std::string::npos)
+                                  ? nodes_str.substr(pos)
+                                  : nodes_str.substr(pos, comma - pos);
+            if (!tok.empty()) {
+                info.numa_nodes.push_back(std::stoi(tok));
+            }
+            pos = (comma == std::string::npos) ? nodes_str.size() : comma + 1;
+        }
+    } catch (const std::exception &) {
+        return false;
+    }
+    return !info.numa_nodes.empty();
+}
+
+std::string resolveSegmentsLocation(const SegmentsLocationInfo &info,
+                                    uint64_t buffer_length, uint64_t offset) {
+    size_t n = info.numa_nodes.size();
+    if (n == 0) return kWildcardLocation;
+    size_t region_size = buffer_length / n;
+    if (region_size == 0) return kWildcardLocation;
+    size_t idx = offset / region_size;
+    if (idx >= n) idx = n - 1;  // clamp for tail bytes
+    return "cpu:" + std::to_string(info.numa_nodes[idx]);
 }
 
 }  // namespace mooncake

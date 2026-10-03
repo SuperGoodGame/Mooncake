@@ -23,7 +23,8 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.23.8
+GOVER=1.25.9
+OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
 print_section() {
@@ -48,23 +49,70 @@ check_success() {
     fi
 }
 
+# Detect ScaleFabric SHCA (shca-tools).
+has_shca_tools() {
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Status}' shca-tools 2>/dev/null | grep -q "install ok installed"
+        return $?
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        rpm -q shca-tools >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+read_os_release_value() {
+    local key="$1"
+    awk -F= -v key="$key" '
+        $1 == key {
+            value = $0
+            sub(/^[^=]*=/, "", value)
+            gsub(/^"|"$/, "", value)
+            print value
+            exit
+        }
+    ' "$OS_RELEASE_FILE"
+}
+
+# Function to detect OS
+detect_os() {
+    if [ -f "$OS_RELEASE_FILE" ]; then
+        ID=$(read_os_release_value ID)
+        VERSION_ID=$(read_os_release_value VERSION_ID)
+        OS=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+        OS_VERSION=$VERSION_ID
+    elif [ -f /etc/redhat-release ]; then
+        OS="centos"
+    else
+        print_error "Cannot detect OS. Supported OS: Ubuntu, Debian, CentOS, RHEL, Rocky, AlmaLinux, EulerOS, openEuler, and Kylin."
+    fi
+
+    echo -e "${GREEN}Detected OS: $OS ${OS_VERSION:-unknown}${NC}"
+}
+
 if [ $(id -u) -ne 0 ]; then
 	print_error "Require root permission, try sudo ./dependencies.sh"
 fi
 
 # Parse command line arguments
 SKIP_CONFIRM=false
+INSTALL_SPDK=false
 for arg in "$@"; do
     case $arg in
         -y|--yes)
             SKIP_CONFIRM=true
             ;;
+        --with-spdk)
+            INSTALL_SPDK=true
+            ;;
         -h|--help)
             echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
             echo -e "Usage: ./dependencies.sh [OPTIONS]"
             echo -e "\nOptions:"
-            echo -e "  -y, --yes    Skip confirmation and install all dependencies"
-            echo -e "  -h, --help   Show this help message and exit"
+            echo -e "  -y, --yes       Skip confirmation and install all dependencies"
+            echo -e "  --with-spdk     Install SPDK for NVMe-oF support"
+            echo -e "  -h, --help      Show this help message and exit"
             exit 0
             ;;
     esac
@@ -75,9 +123,11 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - yalantinglibs"
-echo -e "  - Git submodules"
+echo -e "  - Git submodules (pybind11)"
 echo -e "  - Go $GOVER"
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "  - SPDK (for NVMe-oF support)"
+fi
 echo
 
 # Ask for confirmation unless -y flag is used
@@ -90,125 +140,217 @@ if [ "$SKIP_CONFIRM" = false ]; then
     fi
 fi
 
+# Detect OS
+detect_os
 
 # Update package lists
 print_section "Updating package lists"
-apt-get update
-check_success "Failed to update package lists"
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    apt-get update
+    check_success "Failed to update package lists"
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ] || [ "$OS" = "kylin" ]; then
+    yum install -y dnf-plugins-core epel-release || true
+    yum config-manager --set-enabled powertools || yum config-manager --set-enabled crb || true
+    yum clean all
+    yum makecache
+    check_success "Failed to update package lists"
+else
+    print_error "Unsupported OS: $OS"
+fi
 
 # Install system packages
 print_section "Installing system packages"
 echo -e "${YELLOW}This may take a few minutes...${NC}"
 
-# SYSTEM_PACKAGES="build-essential \
-#                   cmake \
-#                   git \
-#                   wget \
-#                   libibverbs-dev \
-#                   libgoogle-glog-dev \
-#                   libgtest-dev \
-#                   libjsoncpp-dev \
-#                   libunwind-dev \
-#                   libnuma-dev \
-#                   libpython3-dev \
-#                   libboost-all-dev \
-#                   libssl-dev \
-#                   libgrpc-dev \
-#                   libgrpc++-dev \
-#                   libprotobuf-dev \
-#                   libyaml-cpp-dev \
-#                   protobuf-compiler-grpc \
-#                   libcurl4-openssl-dev \
-#                   libhiredis-dev \
-#                   libjemalloc-dev \
-#                   pkg-config \
-#                   patchelf"
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    SYSTEM_PACKAGES="build-essential \
+                     cmake \
+                     ninja-build \
+                     git \
+                     wget \
+                     unzip \
+                     libibverbs-dev \
+                     libgoogle-glog-dev \
+                     libjsoncpp-dev \
+                     libunwind-dev \
+                     libnuma-dev \
+                     libpython3-dev \
+                     libboost-all-dev \
+                     libssl-dev \
+                     libgrpc-dev \
+                     libgrpc++-dev \
+                     libprotobuf-dev \
+                     libyaml-cpp-dev \
+                     protobuf-compiler-grpc \
+                     libcurl4-openssl-dev \
+                     libhiredis-dev \
+                     liburing-dev \
+                     libjemalloc-dev \
+                     libmsgpack-dev \
+                     libzmq3-dev \
+                     libzstd-dev \
+                     libasio-dev \
+                     libxxhash-dev \
+                     pkg-config \
+                     patchelf \
+                     libc6-dev \
+                     libc-bin"
 
-apt-get install -y $SYSTEM_PACKAGES
-check_success "Failed to install system packages"
+    # ScaleFabric SHCA (shca-tools) ships its own libibverbs headers/libs; installing
+    # libibverbs-dev conflicts with it. libboost-all-dev pulls OpenMPI/libfabric,
+    # which also depend on distro ibverbs and fail on SHCA systems.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/libibverbs-dev//g')
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed "s/libboost-all-dev/libboost-dev/g")
+        echo -e "${GREEN}shca-tools package detected. Adjusting system packages accordingly; build with -DUSE_SHCA=ON to enable SHCA support.${NC}"
+    fi
+
+    # Since Ubuntu 26.04, libmsgpack-dev is a transitional package for the C-only
+    # libmsgpack-c-dev, so msgpack.hpp needs libmsgpack-cxx-dev. Ubuntu 22.04 has no
+    # libmsgpack-cxx-dev and ships msgpack.hpp in libmsgpack-dev.
+    if apt-cache show libmsgpack-cxx-dev > /dev/null 2>&1; then
+        SYSTEM_PACKAGES="$SYSTEM_PACKAGES libmsgpack-cxx-dev"
+    fi
+
+    apt-get install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+
+elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
+    SYSTEM_PACKAGES="@development \
+                     cmake \
+                     ninja-build \
+                     git \
+                     wget \
+                     rdma-core-devel \
+                     glog-devel \
+                     gflags-devel \
+                     jsoncpp-devel \
+                     libunwind-devel \
+                     numactl-devel \
+                     python3-devel \
+                     boost1.78-devel \
+                     openssl-devel \
+                     protobuf-devel \
+                     yaml-cpp-devel \
+                     libcurl-devel \
+                     hiredis-devel \
+                     liburing-devel \
+                     jemalloc-devel \
+                     msgpack-devel \
+                     zeromq-devel \
+                     libzstd-devel \
+                     pkgconf-pkg-config \
+                     elfutils-libelf-devel \
+                     patchelf  \
+                     xxhash-devel \
+                     libbsd-devel"
+
+    # Same SHCA conflict on RHEL-family: skip rdma-core-devel when shca-tools is present.
+    if has_shca_tools; then
+        SYSTEM_PACKAGES=$(echo $SYSTEM_PACKAGES | sed 's/rdma-core-devel//g')
+        echo -e "${GREEN}shca-tools package detected. Skipping rdma-core-devel (provided by shca-tools).${NC}"
+    fi
+
+    yum install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+
+elif [ "$OS" = "kylin" ]; then
+    SYSTEM_PACKAGES="@development \
+                     cmake \
+                     ninja-build \
+                     git \
+                     wget \
+                     rdma-core-devel \
+                     glog-devel \
+                     gflags-devel \
+                     jsoncpp-devel \
+                     libunwind-devel \
+                     numactl-devel \
+                     python3-devel \
+                     boost-devel \
+                     openssl-devel \
+                     protobuf-devel \
+                     yaml-cpp-devel \
+                     libcurl-devel \
+                     hiredis-devel \
+                     liburing-devel \
+                     jemalloc-devel \
+                     msgpack-devel \
+                     libzstd-devel \
+                     pkgconf-pkg-config \
+                     elfutils-libelf-devel \
+                     patchelf  \
+                     xxhash-devel \
+                     libbsd-devel"
+
+    if [ -z "${KYLIN_EPKL_URL:-}" ]; then
+        KYLIN_NKVERS_OUTPUT=""
+        if command -v nkvers >/dev/null 2>&1; then
+            KYLIN_NKVERS_OUTPUT=$(nkvers 2>/dev/null)
+        fi
+
+        KYLIN_VERSION=${KYLIN_VERSION:-$(printf '%s\n' "$KYLIN_NKVERS_OUTPUT" | sed -nE 's/.*release[[:space:]]+(V[0-9]+).*/\1/p' | head -n 1)}
+        KYLIN_VERSION=${KYLIN_VERSION:-$OS_VERSION}
+        case "$KYLIN_VERSION" in
+            V*) ;;
+            [0-9]*) KYLIN_VERSION="V${KYLIN_VERSION}" ;;
+        esac
+
+        KYLIN_EPKL_RELEASE=${KYLIN_EPKL_RELEASE:-$(printf '%s\n' "$KYLIN_NKVERS_OUTPUT" | sed -nE 's/.*release[[:space:]]+V[0-9]+[[:space:]]+([0-9]{4})\/.*/\1/p' | head -n 1)}
+        if [ -z "$KYLIN_VERSION" ] || [ -z "$KYLIN_EPKL_RELEASE" ]; then
+            print_error "Cannot detect Kylin release. Set KYLIN_EPKL_URL or KYLIN_EPKL_RELEASE explicitly."
+        fi
+
+        KYLIN_EPKL_URL="https://eps-server.openkylin.top/NS/${KYLIN_VERSION}/${KYLIN_EPKL_RELEASE}/EPKL/main/$(uname -m)/"
+    fi
+    dnf --repofrompath="kylin-epkl,$KYLIN_EPKL_URL" \
+        --setopt=kylin-epkl.gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-kylin \
+        --enablerepo=kylin-epkl install -y $SYSTEM_PACKAGES
+    check_success "Failed to install system packages"
+else
+    print_error "Unsupported OS: $OS"
+fi
+
 print_success "System packages installed successfully"
-
-# Install yalantinglibs
-print_section "Installing yalantinglibs"
-
-# Check if thirdparties directory exists
-if [ ! -d "${REPO_ROOT}/thirdparties" ]; then
-    mkdir -p "${REPO_ROOT}/thirdparties"
-    check_success "Failed to create thirdparties directory"
-fi
-
-# Change to thirdparties directory
-cd "${REPO_ROOT}/thirdparties"
-check_success "Failed to change to thirdparties directory"
-
-# Check if yalantinglibs is already installed
-if [ -d "yalantinglibs" ]; then
-    echo -e "${YELLOW}yalantinglibs directory already exists. Removing for fresh install...${NC}"
-    rm -rf yalantinglibs
-    check_success "Failed to remove existing yalantinglibs directory"
-fi
-
-# Clone yalantinglibs
-echo "Cloning yalantinglibs from ${GITHUB_PROXY}/alibaba/yalantinglibs.git"
-git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
-check_success "Failed to clone yalantinglibs"
-
-# Build and install yalantinglibs
-cd yalantinglibs
-check_success "Failed to change to yalantinglibs directory"
-
-# Checkout version 0.5.5
-echo "Checking out yalantinglibs version 0.5.5..."
-git checkout 0.5.5
-check_success "Failed to checkout yalantinglibs version 0.5.5"
-
-mkdir -p build
-check_success "Failed to create build directory"
-
-cd build
-check_success "Failed to change to build directory"
-
-echo "Configuring yalantinglibs..."
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-check_success "Failed to configure yalantinglibs"
-
-echo "Building yalantinglibs (using $(nproc) cores)..."
-cmake --build . -j$(nproc)
-check_success "Failed to build yalantinglibs"
-
-echo "Installing yalantinglibs..."
-cmake --install .
-check_success "Failed to install yalantinglibs"
-
-print_success "yalantinglibs installed successfully"
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"
 
 # Check if .gitmodules exists
 if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    # Check if submodules are already initialized by looking for the .git directory in the first submodule
-    FIRST_SUBMODULE=$(grep "path" ${REPO_ROOT}/.gitmodules | head -1 | awk '{print $3}')
-
     echo "Enter repository root: ${REPO_ROOT}"
     cd "${REPO_ROOT}"
     check_success "Failed to change to repository root directory"
 
-    if [ -d "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ] || [ -f "${REPO_ROOT}/${FIRST_SUBMODULE}/.git" ]; then
-        echo -e "${YELLOW}Git submodules already initialized. Skipping...${NC}"
-    else
-        echo "Initializing git submodules..."
-        git submodule update --init
-        check_success "Failed to initialize git submodules"
+    echo "Initializing git submodules..."
+    git submodule sync --recursive
+    check_success "Failed to sync git submodules"
+    git submodule update --init --recursive
+    check_success "Failed to initialize git submodules"
 
-        print_success "Git submodules initialized and updated successfully"
-    fi
+    print_success "Git submodules initialized and updated successfully"
 else
     echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
     exit 1
 fi
 
+print_section "Verifying essential build tools"
+
+# Verify getconf and ldd (required for glibc version detection in build_wheel.sh)
+if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+    if ! command -v getconf >/dev/null 2>&1; then
+        print_error "getconf not found after installing system packages. This should not happen."
+    fi
+    if ! command -v ldd >/dev/null 2>&1; then
+        print_error "ldd not found after installing system packages. This should not happen."
+    fi
+    print_success "getconf found: $(getconf --version 2>&1 | head -1)"
+    print_success "ldd found: $(ldd --version 2>&1 | head -1)"
+fi
+
 print_section "Installing Go $GOVER"
+
+USED_CN_MIRROR=false
 
 install_go() {
     ARCH=$(uname -m)
@@ -220,24 +362,46 @@ install_go() {
         echo "Unsupported architecture: $ARCH"
         exit 1
     fi
-    # Download Go
-    echo "Downloading Go $GOVER..."
-    wget -q --show-progress https://go.dev/dl/go$GOVER.linux-$ARCH.tar.gz
-    check_success "Failed to download Go $GOVER"
 
-    # Install Go
+    GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+
+    # Try multiple download mirrors with fallback
+    GO_DOWNLOAD_URLS=(
+        "https://go.dev/dl/${GO_TARBALL}"
+        "https://golang.google.cn/dl/${GO_TARBALL}"
+        "https://mirrors.aliyun.com/golang/${GO_TARBALL}"
+    )
+
+    DOWNLOAD_SUCCESS=false
+    for url in "${GO_DOWNLOAD_URLS[@]}"; do
+        echo "Downloading Go $GOVER from ${url}..."
+        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+            DOWNLOAD_SUCCESS=true
+            if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
+                USED_CN_MIRROR=true
+            fi
+            print_success "Downloaded Go $GOVER from ${url}"
+            break
+        else
+            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
+            rm -f "${GO_TARBALL}"
+        fi
+    done
+
+    if [ "$DOWNLOAD_SUCCESS" = false ]; then
+        print_error "Failed to download Go $GOVER from all mirrors"
+    fi
+
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf go$GOVER.linux-$ARCH.tar.gz
+    tar -C /usr/local -xzf "${GO_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
-    # Clean up downloaded file
-    rm -f go$GOVER.linux-$ARCH.tar.gz
+    rm -f "${GO_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"
 }
 
-# Check if Go is already installed
 if command -v go &> /dev/null; then
     GO_VERSION=$(go version | awk '{print $3}')
     if [[ "$GO_VERSION" == "go$GOVER" ]]; then
@@ -257,6 +421,87 @@ if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
     echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
 fi
 
+# Set GOPROXY only if Go download fell back to a CN mirror
+if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
+    export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+    echo -e "${YELLOW}Detected restricted network (Go was downloaded from a CN mirror).${NC}"
+    echo -e "${YELLOW}GOPROXY set to: ${GOPROXY}${NC}"
+    if ! grep -q "export GOPROXY=" ~/.bashrc; then
+        echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> ~/.bashrc
+        echo -e "${YELLOW}GOPROXY added to ~/.bashrc for future sessions${NC}"
+    fi
+elif [ -n "$GOPROXY" ]; then
+    echo -e "${GREEN}GOPROXY already set to: ${GOPROXY}${NC}"
+fi
+
+# Install SPDK if requested
+if [ "$INSTALL_SPDK" = true ]; then
+    print_section "Installing SPDK"
+
+    if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
+        apt-get install -y libelf-dev
+        check_success "Failed to install NoF dependencies"
+    fi
+
+    cd "${REPO_ROOT}/extern"
+    check_success "Failed to change to extern directory"
+
+    # Remove existing SPDK if present
+    if [ -d "spdk" ]; then
+        echo -e "${YELLOW}SPDK directory already exists. Removing for fresh install...${NC}"
+        rm -rf spdk
+        check_success "Failed to remove existing SPDK directory"
+    fi
+
+    # Clone SPDK
+    echo "Cloning SPDK from ${GITHUB_PROXY}/spdk/spdk.git..."
+    git clone ${GITHUB_PROXY}/spdk/spdk.git
+    check_success "Failed to clone SPDK"
+
+    cd spdk
+    check_success "Failed to change to SPDK directory"
+
+    # Checkout specific version
+    echo "Checking out SPDK version v23.01.1..."
+    git checkout v23.01.1
+    check_success "Failed to checkout SPDK version v23.01.1"
+
+    # Initialize submodules
+    echo "Initializing SPDK submodules..."
+    git submodule update --init
+    check_success "Failed to initialize SPDK submodules"
+
+    # Install SPDK dependencies
+    echo "Installing SPDK dependencies..."
+    ./scripts/pkgdep.sh --rdma
+    check_success "Failed to install SPDK RDMA dependencies"
+
+    # Configure SPDK with RDMA support
+    echo "Configuring SPDK with RDMA support..."
+    ./configure --with-rdma
+    check_success "Failed to configure SPDK"
+
+    # Build SPDK
+    echo "Building SPDK (using $(nproc) cores)..."
+    make -j$(nproc)
+    check_success "Failed to build SPDK"
+
+    # Install SPDK
+    echo "Installing SPDK..."
+    make install
+    check_success "Failed to install SPDK"
+
+    # Copy DPDK libraries to system library path
+    if ls dpdk/build/lib/*.a >/dev/null 2>&1; then
+        echo "Copying DPDK libraries to /usr/local/lib..."
+        cp dpdk/build/lib/*.a /usr/local/lib/
+        check_success "Failed to copy DPDK libraries"
+    fi
+
+    print_success "SPDK installed successfully"
+    cd "${REPO_ROOT}"
+fi
+
 # Return to the repository root
 cd "${REPO_ROOT}"
 
@@ -265,9 +510,15 @@ print_section "Installation Complete"
 echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
-echo -e "  ${GREEN}✓${NC} yalantinglibs"
 echo -e "  ${GREEN}✓${NC} Git submodules"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
+fi
 echo
 echo -e "You can now build and run Mooncake."
 echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
+
+if [ "$INSTALL_SPDK" = true ]; then
+    echo -e "${YELLOW}Note: SPDK requires hugepages and RDMA configuration. Please refer to SPDK documentation for setup.${NC}"
+fi
